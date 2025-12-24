@@ -5,6 +5,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 
+#include <iomanip>
 #include <iostream>
 #include <memory>
 
@@ -111,12 +112,13 @@ private:
         }
 
         std::string source = *source_opt;
+        std::string url = js_request.url;
 
         // Execute in thread pool
         auto self = shared_from_this();
         auto future = thread_pool_.enqueue(
             [source = std::move(source), js_request = std::move(js_request)]
-            (JsRuntime& runtime) -> std::optional<HttpResponse> {
+            (JsRuntime& runtime) -> ExecutionResult {
                 auto ctx = runtime.create_context();
                 return ctx.execute_handler(source, js_request);
             }
@@ -124,13 +126,20 @@ private:
 
         // We need to handle this asynchronously
         // For simplicity, we'll use a detached thread to wait for the result
-        std::thread([self, future = std::move(future)]() mutable {
+        std::thread([self, future = std::move(future), handler_id, url]() mutable {
             try {
                 auto result = future.get();
-                if (result) {
-                    self->send_js_response(*result);
+                
+                // Print stats
+                std::cout << "[" << handler_id << "] " << url 
+                          << " | cpu: " << std::fixed << std::setprecision(2) << result.stats.cpu_time_ms << "ms"
+                          << " | mem: " << (result.stats.memory_used / 1024) << "KB"
+                          << "\n";
+                
+                if (result.response) {
+                    self->send_js_response(*result.response);
                 } else {
-                    self->send_error(500, "Handler execution failed");
+                    self->send_error(500, result.error.empty() ? "Handler execution failed" : result.error);
                 }
             } catch (const std::exception& e) {
                 self->send_error(500, e.what());

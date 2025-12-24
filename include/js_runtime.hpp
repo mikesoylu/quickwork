@@ -29,6 +29,17 @@ struct HttpResponse {
     std::unordered_map<std::string, std::string> headers;
 };
 
+struct ExecutionStats {
+    size_t memory_used = 0;
+    double cpu_time_ms = 0.0;
+};
+
+struct ExecutionResult {
+    std::optional<HttpResponse> response;
+    ExecutionStats stats;
+    std::string error;
+};
+
 class JsContext {
 public:
     JsContext(JSRuntime* rt, const Config& config);
@@ -39,12 +50,13 @@ public:
     JsContext(JsContext&&) noexcept;
     JsContext& operator=(JsContext&&) noexcept;
 
-    [[nodiscard]] std::optional<HttpResponse> execute_handler(
+    [[nodiscard]] ExecutionResult execute_handler(
         std::string_view source,
         const HttpRequest& request
     );
 
     [[nodiscard]] JSContext* get() const noexcept { return ctx_; }
+    [[nodiscard]] JSRuntime* runtime() const noexcept { return JS_GetRuntime(ctx_); }
     [[nodiscard]] bool has_error() const noexcept { return has_error_; }
     [[nodiscard]] const std::string& get_error() const noexcept { return error_message_; }
 

@@ -267,10 +267,12 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
     }
 }
 
-std::optional<HttpResponse> JsContext::execute_handler(
+ExecutionResult JsContext::execute_handler(
     std::string_view source,
     const HttpRequest& request)
 {
+    ExecutionResult exec_result;
+    
     // Create request object and set it globally
     JSValue global = JS_GetGlobalObject(ctx_);
     JSValue request_obj = bindings::create_request(ctx_, request);
@@ -304,7 +306,8 @@ std::optional<HttpResponse> JsContext::execute_handler(
     
     if (JS_IsException(setup_result)) {
         handle_exception();
-        return std::nullopt;
+        exec_result.error = error_message_;
+        return exec_result;
     }
     JS_FreeValue(ctx_, setup_result);
 
@@ -323,10 +326,25 @@ std::optional<HttpResponse> JsContext::execute_handler(
 
     if (JS_IsException(result)) {
         handle_exception();
-        return std::nullopt;
+        exec_result.error = error_message_;
+        return exec_result;
     }
 
-    return extract_response(result);
+    exec_result.response = extract_response(result);
+    
+    // Collect stats
+    auto end_time = std::chrono::steady_clock::now();
+    exec_result.stats.cpu_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time_).count();
+    
+    JSMemoryUsage mem_usage;
+    JS_ComputeMemoryUsage(JS_GetRuntime(ctx_), &mem_usage);
+    exec_result.stats.memory_used = static_cast<size_t>(mem_usage.memory_used_size);
+    
+    if (!exec_result.response) {
+        exec_result.error = error_message_;
+    }
+    
+    return exec_result;
 }
 
 }  // namespace quickwork
