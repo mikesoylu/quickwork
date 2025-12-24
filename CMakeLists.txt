@@ -20,6 +20,7 @@ FetchContent_MakeAvailable(Boost)
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 # Fetch QuickJS from bellard.org
 FetchContent_Declare(
@@ -74,6 +75,8 @@ target_link_libraries(quickwork PRIVATE
     Boost::program_options
     Threads::Threads
     OpenSSL::Crypto
+    OpenSSL::SSL
+    CURL::libcurl
     ${CMAKE_DL_LIBS}
 )
 
