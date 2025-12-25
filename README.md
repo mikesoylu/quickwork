@@ -36,6 +36,8 @@ Options:
   -m [ --max-memory ] arg (=64)        Max memory per runtime in MB
   -t [ --max-cpu-time ] arg (=5000)    Max CPU time per request in ms
   -j [ --threads ] arg (=0)            Number of worker threads (0 = auto)
+  -s [ --cache-size ] arg (=1024)      Max handlers in memory cache (LRU)
+  -S [ --max-storage ] arg (=0)        Max disk storage for bytecode cache in MB (0 = unlimited)
 ```
 
 ### Registering a Handler

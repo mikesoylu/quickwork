@@ -74,9 +74,14 @@ private:
     [[nodiscard]] static std::string compute_hash(std::string_view source);
     [[nodiscard]] static Bytecode compile_to_bytecode(::JSRuntime* rt, std::string_view source);
     void ensure_cache_dir() const;
+    
+    // Storage management
+    [[nodiscard]] size_t calculate_cache_size() const;
+    void enforce_storage_limit(size_t incoming_size);
 
     std::filesystem::path cache_dir_;
     LRUCache cache_;
+    size_t max_storage_bytes_;  // 0 = unlimited
 };
 
 }  // namespace quickwork

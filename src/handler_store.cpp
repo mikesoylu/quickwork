@@ -1,6 +1,7 @@
 #include "handler_store.hpp"
 #include "module_resolver.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -74,12 +75,78 @@ size_t LRUCache::size() const {
 HandlerStore::HandlerStore(const Config& config)
     : cache_dir_(config.cache_dir)
     , cache_(config.handler_cache_size)
+    , max_storage_bytes_(config.get_max_cache_storage_bytes())
 {
     ensure_cache_dir();
 }
 
 void HandlerStore::ensure_cache_dir() const {
     std::filesystem::create_directories(cache_dir_);
+}
+
+size_t HandlerStore::calculate_cache_size() const {
+    size_t total_size = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_dir_)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".qjbc") {
+            total_size += entry.file_size();
+        }
+    }
+    return total_size;
+}
+
+void HandlerStore::enforce_storage_limit(size_t incoming_size) {
+    if (max_storage_bytes_ == 0) {
+        return;  // No limit
+    }
+
+    size_t current_size = calculate_cache_size();
+    
+    // Check if we need to free space
+    // Target: free 10% extra space to avoid frequent evictions
+    size_t target_size = max_storage_bytes_ * 90 / 100;
+    
+    if (current_size + incoming_size <= max_storage_bytes_) {
+        return;  // Enough space
+    }
+
+    // Collect all bytecode files with their modification times
+    struct FileInfo {
+        std::filesystem::path path;
+        std::filesystem::file_time_type mtime;
+        size_t size;
+    };
+    std::vector<FileInfo> files;
+
+    for (const auto& entry : std::filesystem::directory_iterator(cache_dir_)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".qjbc") {
+            files.push_back({
+                entry.path(),
+                entry.last_write_time(),
+                entry.file_size()
+            });
+        }
+    }
+
+    // Sort by modification time (oldest first)
+    std::sort(files.begin(), files.end(), [](const FileInfo& a, const FileInfo& b) {
+        return a.mtime < b.mtime;
+    });
+
+    // Delete oldest files until we have enough space
+    size_t space_needed = (current_size + incoming_size) - target_size;
+    size_t freed = 0;
+
+    for (const auto& file : files) {
+        if (freed >= space_needed) {
+            break;
+        }
+        
+        std::error_code ec;
+        std::filesystem::remove(file.path, ec);
+        if (!ec) {
+            freed += file.size;
+        }
+    }
 }
 
 std::string HandlerStore::compute_hash(std::string_view source) {
@@ -224,6 +291,9 @@ std::string HandlerStore::store(::JSRuntime* rt, std::string_view source) {
 
     // Compile to bytecode
     Bytecode bc = compile_to_bytecode(rt, source);
+
+    // Enforce storage limit before writing (deletes oldest files if needed)
+    enforce_storage_limit(bc.size());
 
     // Write bytecode to disk
     std::ofstream file(path, std::ios::binary);
