@@ -12,7 +12,7 @@ ThreadPool::ThreadPool(const Config& config) : config_(config) {
         workers_.emplace_back(&ThreadPool::worker_thread, this, i);
     }
 
-    std::cout << "Thread pool started with " << num_threads << " threads\n";
+    std::cout << "Thread pool started with " << num_threads << " worker threads\n";
 }
 
 ThreadPool::~ThreadPool() {

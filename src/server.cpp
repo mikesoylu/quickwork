@@ -5,6 +5,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -114,37 +115,22 @@ private:
         std::string source = *source_opt;
         std::string url = js_request.url;
 
-        // Execute in thread pool
+        // Execute on thread pool with callback
         auto self = shared_from_this();
-        auto future = thread_pool_.enqueue(
+        thread_pool_.enqueue_with_callback(
             [source = std::move(source), js_request = std::move(js_request)]
             (JsRuntime& runtime) -> ExecutionResult {
                 auto ctx = runtime.create_context();
                 return ctx.execute_handler(source, js_request);
-            }
-        );
-
-        // We need to handle this asynchronously
-        // For simplicity, we'll use a detached thread to wait for the result
-        std::thread([self, future = std::move(future), handler_id, url]() mutable {
-            try {
-                auto result = future.get();
-                
-                // Print stats
-                std::cout << "[" << handler_id << "] " << url 
-                          << " | cpu: " << std::fixed << std::setprecision(2) << result.stats.cpu_time_ms << "ms"
-                          << " | mem: " << (result.stats.memory_used / 1024) << "KB"
-                          << "\n";
-                
+            },
+            [self](ExecutionResult result) {
                 if (result.response) {
                     self->send_js_response(*result.response);
                 } else {
                     self->send_error(500, result.error.empty() ? "Handler execution failed" : result.error);
                 }
-            } catch (const std::exception& e) {
-                self->send_error(500, e.what());
             }
-        }).detach();
+        );
     }
 
     void send_js_response(const HttpResponse& js_response) {
@@ -156,6 +142,13 @@ private:
         res.keep_alive(request_.keep_alive());
 
         for (const auto& [key, value] : js_response.headers) {
+            // Skip hop-by-hop headers that shouldn't be forwarded
+            std::string lower_key = key;
+            std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+            if (lower_key == "connection" || lower_key == "keep-alive" ||
+                lower_key == "transfer-encoding" || lower_key == "content-length") {
+                continue;
+            }
             res.set(key, value);
         }
 

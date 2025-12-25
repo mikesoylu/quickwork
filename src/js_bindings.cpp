@@ -515,12 +515,16 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
     // If fetch failed (status_code == 0), reject the promise
     if (fetch_response.status_code == 0) {
         JSValue error = JS_NewError(ctx);
-        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, response_data->body.c_str()));
+        // Copy error message before freeing response_obj (which owns response_data)
+        std::string error_msg = response_data->body;
+        JS_FreeValue(ctx, response_obj);
+        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, error_msg.c_str()));
         JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &error);
         JS_FreeValue(ctx, error);
-        JS_FreeValue(ctx, response_obj);
     } else {
         JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &response_obj);
+        // JS_Call doesn't steal the reference, so we need to free our copy
+        JS_FreeValue(ctx, response_obj);
     }
     
     JS_FreeValue(ctx, resolving_funcs[0]);

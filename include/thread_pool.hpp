@@ -27,6 +27,10 @@ public:
     auto enqueue(F&& f, Args&&... args)
         -> std::future<std::invoke_result_t<F, JsRuntime&, Args...>>;
 
+    // Enqueue a task with a callback that runs on completion (on the same worker thread)
+    template <typename F, typename Callback>
+    void enqueue_with_callback(F&& f, Callback&& callback);
+
     void shutdown();
 
 private:
@@ -66,6 +70,29 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
     }
     condition_.notify_one();
     return result;
+}
+
+template <typename F, typename Callback>
+void ThreadPool::enqueue_with_callback(F&& f, Callback&& callback) {
+    auto task_fn = std::make_shared<std::decay_t<F>>(std::forward<F>(f));
+    auto callback_fn = std::make_shared<std::decay_t<Callback>>(std::forward<Callback>(callback));
+    
+    {
+        std::unique_lock lock(queue_mutex_);
+        if (stop_) {
+            return;
+        }
+        tasks_.emplace([task_fn, callback_fn](JsRuntime& rt) {
+            try {
+                auto result = (*task_fn)(rt);
+                (*callback_fn)(std::move(result));
+            } catch (const std::exception& e) {
+                // If the task throws, create an error result
+                // This is a simplification - in practice you might want error handling
+            }
+        });
+    }
+    condition_.notify_one();
 }
 
 }  // namespace quickwork

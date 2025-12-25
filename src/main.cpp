@@ -2,6 +2,7 @@
 #include "server.hpp"
 
 #include <boost/program_options.hpp>
+#include <curl/curl.h>
 
 #include <csignal>
 #include <iostream>
@@ -71,6 +72,9 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // Initialize libcurl globally (required for thread safety)
+    curl_global_init(CURL_GLOBAL_ALL);
+
     std::cout << "QuickWork v1.0.0\n";
     std::cout << "===============\n";
     std::cout << "Cache directory: " << config.cache_dir << "\n";
@@ -83,8 +87,10 @@ int main(int argc, char* argv[]) {
         g_server->run();
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << "\n";
+        curl_global_cleanup();
         return 1;
     }
 
+    curl_global_cleanup();
     return 0;
 }
