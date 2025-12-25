@@ -198,17 +198,19 @@ private:
     void consume_stream(std::shared_ptr<StreamingState> state) {
         // Wait for first chunk or completion
         std::unique_lock<std::mutex> lock(state->mutex);
-        state->cv.wait_for(lock, std::chrono::milliseconds(100), [&state] {
-            return !state->chunks.empty() || state->complete;
-        });
+        
+        // Wait until we have streaming data or the handler completes
+        while (!state->has_data && !state->complete) {
+            state->cv.wait_for(lock, std::chrono::milliseconds(100));
+        }
         
         // If no streaming data and complete, let the regular callback handle it
         if (!state->has_data && state->complete) {
             return;
         }
         
-        // Send headers if not sent yet
-        if (!state->headers_sent) {
+        // Send headers if not sent yet (only if we have streaming data)
+        if (!state->headers_sent && state->has_data) {
             state->headers_sent = true;
             lock.unlock();
             

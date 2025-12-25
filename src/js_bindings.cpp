@@ -7,11 +7,13 @@ extern "C" {
 
 #include <curl/curl.h>
 #include <openssl/rand.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -563,6 +565,407 @@ quickwork::StreamWriter get_current_stream_writer() {
 }
 
 // ============================================================================
+// ReadableStream implementation for streaming fetch
+// ============================================================================
+
+static JSClassID js_readable_stream_class_id;
+static JSClassID js_readable_stream_reader_class_id;
+
+// Shared state for streaming - curl writes here, reader reads from here
+struct StreamState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::queue<std::string> chunks;
+    bool done = false;
+    bool error = false;
+    std::string error_message;
+    CURL* curl = nullptr;
+    struct curl_slist* headers = nullptr;
+    bool curl_started = false;
+    bool curl_finished = false;
+    bool headers_received = false;  // Set when we get HTTP status line
+    
+    // Request data (kept alive for curl)
+    std::string url;
+    std::string method;
+    std::string body;
+    std::unordered_map<std::string, std::string> request_headers;
+    std::unordered_map<std::string, std::string> response_headers;
+    long status_code = 0;
+};
+
+struct ReadableStreamData {
+    std::shared_ptr<StreamState> state;
+    bool locked = false;
+};
+
+struct ReadableStreamReaderData {
+    std::shared_ptr<StreamState> state;
+    JSContext* ctx;
+};
+
+// Curl callback that pushes chunks to the stream state
+static size_t stream_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* state = static_cast<StreamState*>(userdata);
+    size_t total = size * nmemb;
+    
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->chunks.push(std::string(ptr, total));
+    state->cv.notify_one();
+    
+    return total;
+}
+
+static size_t stream_header_callback(char* buffer, size_t size, size_t nitems, void* userdata) {
+    auto* state = static_cast<StreamState*>(userdata);
+    std::string header(buffer, size * nitems);
+    
+    while (!header.empty() && (header.back() == '\r' || header.back() == '\n')) {
+        header.pop_back();
+    }
+    
+    // Empty line signals end of headers
+    if (header.empty()) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->headers_received = true;
+        state->cv.notify_all();
+        return size * nitems;
+    }
+    
+    // Parse HTTP status line (e.g., "HTTP/1.1 200 OK")
+    if (header.substr(0, 5) == "HTTP/") {
+        size_t space1 = header.find(' ');
+        if (space1 != std::string::npos) {
+            size_t space2 = header.find(' ', space1 + 1);
+            std::string status_str = header.substr(space1 + 1, space2 - space1 - 1);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->status_code = std::stol(status_str);
+        }
+        return size * nitems;
+    }
+    
+    size_t colon_pos = header.find(':');
+    if (colon_pos != std::string::npos) {
+        std::string key = header.substr(0, colon_pos);
+        std::string value = header.substr(colon_pos + 1);
+        while (!value.empty() && value.front() == ' ') {
+            value.erase(0, 1);
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->response_headers[key] = value;
+    }
+    
+    return size * nitems;
+}
+
+// Perform curl request (called from reader.read())
+static void perform_streaming_fetch(std::shared_ptr<StreamState> state) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = true;
+        state->error_message = "Failed to initialize curl";
+        state->done = true;
+        state->cv.notify_one();
+        return;
+    }
+    
+    curl_easy_setopt(curl, CURLOPT_URL, state->url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, state.get());
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, stream_header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, state.get());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    
+    if (state->method == "POST") {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, state->body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(state->body.size()));
+    } else if (state->method == "PUT") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, state->body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(state->body.size()));
+    } else if (state->method == "DELETE") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    } else if (state->method == "PATCH") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, state->body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(state->body.size()));
+    }
+    
+    struct curl_slist* curl_headers = nullptr;
+    for (const auto& [key, value] : state->request_headers) {
+        std::string header_line = key + ": " + value;
+        curl_headers = curl_slist_append(curl_headers, header_line.c_str());
+    }
+    if (curl_headers) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
+    }
+    
+    CURLcode res = curl_easy_perform(curl);
+    
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &state->status_code);
+        } else {
+            state->error = true;
+            state->error_message = curl_easy_strerror(res);
+        }
+        state->done = true;
+        state->curl_finished = true;
+        state->cv.notify_one();
+    }
+    
+    if (curl_headers) {
+        curl_slist_free_all(curl_headers);
+    }
+    curl_easy_cleanup(curl);
+}
+
+static void js_readable_stream_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* data = static_cast<ReadableStreamData*>(JS_GetOpaque(val, js_readable_stream_class_id));
+    delete data;
+}
+
+static void js_readable_stream_reader_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* data = static_cast<ReadableStreamReaderData*>(JS_GetOpaque(val, js_readable_stream_reader_class_id));
+    delete data;
+}
+
+static JSClassDef js_readable_stream_class = {
+    .class_name = "ReadableStream",
+    .finalizer = js_readable_stream_finalizer,
+};
+
+static JSClassDef js_readable_stream_reader_class = {
+    .class_name = "ReadableStreamDefaultReader",
+    .finalizer = js_readable_stream_reader_finalizer,
+};
+
+// reader.read() -> Promise<{done: bool, value: Uint8Array}>
+static JSValue js_reader_read(JSContext* ctx, JSValueConst this_val,
+                              int /*argc*/, JSValueConst* /*argv*/) {
+    auto* reader_data = static_cast<ReadableStreamReaderData*>(
+        JS_GetOpaque(this_val, js_readable_stream_reader_class_id));
+    if (!reader_data || !reader_data->state) {
+        return JS_ThrowTypeError(ctx, "Invalid reader");
+    }
+    
+    auto state = reader_data->state;
+    
+    // Get next chunk - wait if necessary
+    std::string chunk;
+    bool is_done = false;
+    
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        
+        // Wait for a chunk or completion
+        state->cv.wait(lock, [&state] {
+            return !state->chunks.empty() || state->done;
+        });
+        
+        if (!state->chunks.empty()) {
+            chunk = std::move(state->chunks.front());
+            state->chunks.pop();
+        } else if (state->done) {
+            is_done = true;
+        }
+    }
+    
+    // Create result object {done, value}
+    JSValue result = JS_NewObject(ctx);
+    
+    if (is_done) {
+        JS_SetPropertyStr(ctx, result, "done", JS_TRUE);
+        JS_SetPropertyStr(ctx, result, "value", JS_UNDEFINED);
+    } else {
+        JS_SetPropertyStr(ctx, result, "done", JS_FALSE);
+        
+        // Create Uint8Array from chunk
+        // JS_NewTypedArray expects (buffer, byteOffset, length) as arguments
+        JSValue array_buffer = JS_NewArrayBufferCopy(ctx, 
+            reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
+        JSValue typed_array_args[] = { 
+            array_buffer, 
+            JS_NewInt32(ctx, 0),  // byteOffset
+            JS_NewInt32(ctx, static_cast<int32_t>(chunk.size()))  // length
+        };
+        JSValue uint8_array = JS_NewTypedArray(ctx, 3, typed_array_args, JS_TYPED_ARRAY_UINT8);
+        JS_FreeValue(ctx, array_buffer);
+        JS_FreeValue(ctx, typed_array_args[1]);
+        JS_FreeValue(ctx, typed_array_args[2]);
+        
+        JS_SetPropertyStr(ctx, result, "value", uint8_array);
+    }
+    
+    // Return resolved promise
+    JSValue resolving_funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &result);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    
+    return promise;
+}
+
+// stream.getReader() -> ReadableStreamDefaultReader
+static JSValue js_stream_get_reader(JSContext* ctx, JSValueConst this_val,
+                                    int /*argc*/, JSValueConst* /*argv*/) {
+    auto* stream_data = static_cast<ReadableStreamData*>(
+        JS_GetOpaque(this_val, js_readable_stream_class_id));
+    if (!stream_data) {
+        return JS_ThrowTypeError(ctx, "Invalid stream");
+    }
+    
+    if (stream_data->locked) {
+        return JS_ThrowTypeError(ctx, "ReadableStream is locked");
+    }
+    
+    stream_data->locked = true;
+    
+    // Create reader
+    JSValue reader = JS_NewObjectClass(ctx, js_readable_stream_reader_class_id);
+    auto* reader_data = new ReadableStreamReaderData();
+    reader_data->state = stream_data->state;
+    reader_data->ctx = ctx;
+    JS_SetOpaque(reader, reader_data);
+    
+    // Add read method to reader
+    JS_SetPropertyStr(ctx, reader, "read",
+        JS_NewCFunction(ctx, js_reader_read, "read", 0));
+    
+    return reader;
+}
+
+// Create a ReadableStream from a shared state
+static JSValue create_readable_stream(JSContext* ctx, std::shared_ptr<StreamState> state) {
+    JSValue stream = JS_NewObjectClass(ctx, js_readable_stream_class_id);
+    auto* stream_data = new ReadableStreamData();
+    stream_data->state = state;
+    JS_SetOpaque(stream, stream_data);
+    
+    // Add getReader method
+    JS_SetPropertyStr(ctx, stream, "getReader",
+        JS_NewCFunction(ctx, js_stream_get_reader, "getReader", 0));
+    
+    return stream;
+}
+
+// ============================================================================
+// TextDecoder implementation for decoding Uint8Array to string
+// ============================================================================
+
+static JSClassID js_text_decoder_class_id;
+
+struct TextDecoderData {
+    std::string encoding;  // Currently only "utf-8" is supported
+};
+
+static void js_text_decoder_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* data = static_cast<TextDecoderData*>(JS_GetOpaque(val, js_text_decoder_class_id));
+    delete data;
+}
+
+static JSClassDef js_text_decoder_class = {
+    .class_name = "TextDecoder",
+    .finalizer = js_text_decoder_finalizer,
+};
+
+// TextDecoder.decode(input) -> string
+static JSValue js_text_decoder_decode(JSContext* ctx, JSValueConst this_val,
+                                      int argc, JSValueConst* argv) {
+    auto* data = static_cast<TextDecoderData*>(JS_GetOpaque(this_val, js_text_decoder_class_id));
+    if (!data) {
+        return JS_ThrowTypeError(ctx, "Invalid TextDecoder");
+    }
+    
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+        return JS_NewString(ctx, "");
+    }
+    
+    // Get the TypedArray buffer
+    size_t byte_offset = 0;
+    size_t byte_length = 0;
+    size_t bytes_per_element = 0;
+    
+    JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_length, &bytes_per_element);
+    if (JS_IsException(buffer)) {
+        // Maybe it's an ArrayBuffer directly?
+        size_t buffer_size = 0;
+        uint8_t* buf = JS_GetArrayBuffer(ctx, &buffer_size, argv[0]);
+        if (buf) {
+            return JS_NewStringLen(ctx, reinterpret_cast<const char*>(buf), buffer_size);
+        }
+        return JS_ThrowTypeError(ctx, "TextDecoder.decode: argument must be a TypedArray or ArrayBuffer");
+    }
+    
+    // Get the underlying buffer data
+    size_t buffer_size = 0;
+    uint8_t* buf = JS_GetArrayBuffer(ctx, &buffer_size, buffer);
+    JS_FreeValue(ctx, buffer);
+    
+    if (!buf) {
+        return JS_ThrowTypeError(ctx, "TextDecoder.decode: failed to get array buffer");
+    }
+    
+    // Decode as UTF-8 (the only encoding we support)
+    return JS_NewStringLen(ctx, reinterpret_cast<const char*>(buf + byte_offset), byte_length);
+}
+
+static JSValue js_text_decoder_constructor(JSContext* ctx, JSValueConst /*new_target*/,
+                                           int argc, JSValueConst* argv) {
+    JSValue obj = JS_NewObjectClass(ctx, js_text_decoder_class_id);
+    if (JS_IsException(obj)) return obj;
+    
+    auto* data = new TextDecoderData();
+    data->encoding = "utf-8";  // Default encoding
+    
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        const char* enc = JS_ToCString(ctx, argv[0]);
+        if (enc) {
+            // Normalize encoding name
+            std::string enc_str(enc);
+            std::transform(enc_str.begin(), enc_str.end(), enc_str.begin(), ::tolower);
+            if (enc_str == "utf-8" || enc_str == "utf8") {
+                data->encoding = "utf-8";
+            }
+            // We only support UTF-8 for now
+            JS_FreeCString(ctx, enc);
+        }
+    }
+    
+    JS_SetOpaque(obj, data);
+    
+    // Add decode method
+    JS_SetPropertyStr(ctx, obj, "decode",
+        JS_NewCFunction(ctx, js_text_decoder_decode, "decode", 1));
+    
+    // Add encoding property
+    JS_SetPropertyStr(ctx, obj, "encoding", JS_NewString(ctx, data->encoding.c_str()));
+    
+    return obj;
+}
+
+void setup_text_decoder(JSContext* ctx) {
+    // Register TextDecoder class
+    JS_NewClassID(&js_text_decoder_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), js_text_decoder_class_id, &js_text_decoder_class);
+    
+    // TextDecoder constructor
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue text_decoder_ctor = JS_NewCFunction2(ctx, js_text_decoder_constructor, 
+                                                  "TextDecoder", 1,
+                                                  JS_CFUNC_constructor, 0);
+    JS_SetPropertyStr(ctx, global, "TextDecoder", text_decoder_ctor);
+    JS_FreeValue(ctx, global);
+}
+
+// ============================================================================
 // Fetch API implementation using libcurl
 // ============================================================================
 
@@ -573,6 +976,8 @@ struct FetchResponseData {
     long status_code = 0;
     std::string body;
     std::unordered_map<std::string, std::string> headers;
+    std::shared_ptr<StreamState> stream_state;  // For streaming responses
+    bool is_streaming = false;
 };
 
 static void js_fetch_response_finalizer(JSRuntime* /*rt*/, JSValue val) {
@@ -614,6 +1019,13 @@ static JSValue js_fetch_response_get_ok(JSContext* ctx, JSValueConst this_val) {
 static JSValue js_fetch_response_get_body(JSContext* ctx, JSValueConst this_val) {
     auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
     if (!data) return JS_UNDEFINED;
+    
+    // If streaming, return ReadableStream
+    if (data->stream_state) {
+        return create_readable_stream(ctx, data->stream_state);
+    }
+    
+    // Otherwise return body as string (legacy behavior)
     return JS_NewString(ctx, data->body.c_str());
 }
 
@@ -822,18 +1234,51 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
         JS_FreeValue(ctx, headers_val);
     }
     
-    // Perform the fetch (synchronously, but return a Promise for API compatibility)
-    FetchResponse fetch_response = perform_fetch(url, method, headers, body);
+    // Create StreamState for streaming
+    auto stream_state = std::make_shared<StreamState>();
+    stream_state->url = url;
+    stream_state->method = method;
+    stream_state->body = body;
+    stream_state->request_headers = headers;
+    stream_state->curl_started = true;
+    
+    // Start curl in background thread
+    std::thread([stream_state]() {
+        perform_streaming_fetch(stream_state);
+    }).detach();
+    
+    // Wait for headers to be received (this gives us status code)
+    {
+        std::unique_lock<std::mutex> lock(stream_state->mutex);
+        stream_state->cv.wait(lock, [&stream_state] {
+            return stream_state->headers_received || stream_state->done || stream_state->error;
+        });
+    }
+    
+    // Check for errors
+    if (stream_state->error) {
+        JSValue resolving_funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+        JSValue error = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, stream_state->error_message.c_str()));
+        JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &error);
+        JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        return promise;
+    }
     
     // Create response object using our FetchResponse class
     JSValue response_obj = JS_NewObjectClass(ctx, static_cast<int>(js_fetch_response_class_id));
     auto* response_data = new FetchResponseData();
-    response_data->status_code = fetch_response.status_code;
-    response_data->body = std::move(fetch_response.body);
-    response_data->headers = std::move(fetch_response.headers);
+    response_data->status_code = stream_state->status_code;
+    response_data->stream_state = stream_state;
+    response_data->is_streaming = true;
+    response_data->headers = stream_state->response_headers;
+    
     JS_SetOpaque(response_obj, response_data);
     
-    // Return a resolved Promise
+    // Return a resolved Promise with the response
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise)) {
@@ -841,20 +1286,8 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
         return promise;
     }
     
-    // If fetch failed (status_code == 0), reject the promise
-    if (fetch_response.status_code == 0) {
-        JSValue error = JS_NewError(ctx);
-        // Copy error message before freeing response_obj (which owns response_data)
-        std::string error_msg = response_data->body;
-        JS_FreeValue(ctx, response_obj);
-        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, error_msg.c_str()));
-        JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &error);
-        JS_FreeValue(ctx, error);
-    } else {
-        JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &response_obj);
-        // JS_Call doesn't steal the reference, so we need to free our copy
-        JS_FreeValue(ctx, response_obj);
-    }
+    JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &response_obj);
+    JS_FreeValue(ctx, response_obj);
     
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
@@ -1058,6 +1491,14 @@ void setup_fetch(JSContext* ctx) {
     JS_SetPropertyFunctionList(ctx, proto, js_fetch_response_proto_funcs,
                                sizeof(js_fetch_response_proto_funcs) / sizeof(js_fetch_response_proto_funcs[0]));
     JS_SetClassProto(ctx, js_fetch_response_class_id, proto);
+    
+    // Register ReadableStream class
+    JS_NewClassID(&js_readable_stream_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), js_readable_stream_class_id, &js_readable_stream_class);
+    
+    // Register ReadableStreamDefaultReader class
+    JS_NewClassID(&js_readable_stream_reader_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), js_readable_stream_reader_class_id, &js_readable_stream_reader_class);
     
     // Register fetch functions
     JSValue global = JS_GetGlobalObject(ctx);

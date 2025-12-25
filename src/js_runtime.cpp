@@ -148,6 +148,7 @@ void JsContext::setup_bindings() {
     bindings::setup_response_class(ctx_);
     bindings::setup_stream_response_class(ctx_);
     bindings::setup_fetch(ctx_);
+    bindings::setup_text_decoder(ctx_);
     bindings::setup_timers(ctx_);
 }
 

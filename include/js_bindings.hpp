@@ -22,6 +22,7 @@ void setup_request_class(JSContext* ctx);
 void setup_response_class(JSContext* ctx);
 void setup_stream_response_class(JSContext* ctx);
 void setup_fetch(JSContext* ctx);
+void setup_text_decoder(JSContext* ctx);
 void setup_timers(JSContext* ctx);
 void cleanup_timers(JSContext* ctx);
 JSValue create_request(JSContext* ctx, const HttpRequest& request);
