@@ -134,3 +134,21 @@ endif()
 target_compile_options(quickwork PRIVATE
     -Wall -Wextra -fpermissive
 )
+
+# Testing support
+enable_testing()
+
+# Custom test target that runs the comprehensive test suite
+add_custom_target(run_tests
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh
+    DEPENDS quickwork
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    COMMENT "Running quickwork test suite..."
+)
+
+# Add a simple CTest entry
+add_test(
+    NAME quickwork_test_suite
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
