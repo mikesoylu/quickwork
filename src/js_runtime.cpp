@@ -113,6 +113,7 @@ JsContext::JsContext(JSRuntime* rt, const Config& config) : config_(config) {
 JsContext::~JsContext() {
     if (ctx_) {
         bindings::cleanup_timers(ctx_);
+        bindings::cleanup_pending_fetches(ctx_);
         JS_FreeContext(ctx_);
     }
 }
@@ -287,10 +288,13 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
         // Process any expired timers
         bool timer_fired = bindings::process_timers(ctx_);
         
-        // If no jobs and no timers fired, check if we should continue waiting
-        if (ret == 0 && !timer_fired) {
-            // Check if there are pending timers we need to wait for
-            if (!bindings::has_pending_timers(ctx_)) {
+        // Process any pending fetch operations
+        bool fetch_processed = bindings::process_pending_fetches(ctx_);
+        
+        // If no jobs, no timers fired, and no fetches processed, check if we should continue waiting
+        if (ret == 0 && !timer_fired && !fetch_processed) {
+            // Check if there are pending timers or fetches we need to wait for
+            if (!bindings::has_pending_timers(ctx_) && !bindings::has_pending_fetches(ctx_)) {
                 break;
             }
             // Small sleep to avoid busy-waiting

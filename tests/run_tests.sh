@@ -1853,21 +1853,24 @@ test_fetch_promise_all() {
         return 0
     fi
     
+    # Make 20 parallel requests to example.com
+    # If sequential, each request takes ~100-200ms = 2-4s total
+    # If parallel, should complete in ~200-500ms total
     local handler='export default async function(req) {
         const start = Date.now();
+        const urls = Array(20).fill("https://example.com");
         
-        const [r1, r2, r3] = await Promise.all([
-            fetch("https://httpbin.org/delay/1"),
-            fetch("https://httpbin.org/delay/1"),
-            fetch("https://httpbin.org/delay/1")
-        ]);
+        const responses = await Promise.all(urls.map(url => fetch(url)));
         
         const elapsed = Date.now() - start;
+        const allOk = responses.every(r => r.ok);
         
         return Response.json({ 
-            allOk: r1.ok && r2.ok && r3.ok,
-            // If parallel, should take ~1s, not ~3s
-            parallel: elapsed < 2500
+            count: responses.length,
+            allOk: allOk,
+            elapsed: elapsed,
+            // 20 sequential requests would take 2-4s, parallel should be under 2s
+            parallel: elapsed < 2000
         });
     }'
     
@@ -1878,6 +1881,7 @@ test_fetch_promise_all() {
     local response
     response=$(execute_handler "$id")
     
+    assert_contains "$response" '"count":20' && \
     assert_contains "$response" '"allOk":true' && \
     assert_contains "$response" '"parallel":true'
 }

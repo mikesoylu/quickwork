@@ -31,6 +31,11 @@ JSValue create_request(JSContext* ctx, const HttpRequest& request);
 bool process_timers(JSContext* ctx);
 bool has_pending_timers(JSContext* ctx);
 
+// Fetch management - called from the event loop
+bool process_pending_fetches(JSContext* ctx);
+bool has_pending_fetches(JSContext* ctx);
+void cleanup_pending_fetches(JSContext* ctx);
+
 // StreamResponse data access
 struct StreamResponseData {
     int status = 200;

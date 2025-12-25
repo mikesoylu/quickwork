@@ -594,6 +594,47 @@ struct StreamState {
     long status_code = 0;
 };
 
+// Pending fetch operation for async resolution
+struct PendingFetch {
+    std::shared_ptr<StreamState> stream_state;
+    JSValue resolve_func;
+    JSValue reject_func;
+    JSContext* ctx;
+};
+
+// Per-context pending fetches stored similarly to timers
+struct FetchState {
+    std::vector<PendingFetch> pending;
+};
+
+static JSClassID js_fetch_state_class_id;
+static bool fetch_class_registered = false;
+
+static void js_fetch_state_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* state = static_cast<FetchState*>(JS_GetOpaque(val, js_fetch_state_class_id));
+    // Note: pending fetches should be cleaned up before context destruction
+    delete state;
+}
+
+static JSClassDef js_fetch_state_class = {
+    .class_name = "FetchState",
+    .finalizer = js_fetch_state_finalizer,
+};
+
+static FetchState* get_fetch_state(JSContext* ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue state_val = JS_GetPropertyStr(ctx, global, "__fetch_state__");
+    JS_FreeValue(ctx, global);
+    
+    if (JS_IsUndefined(state_val)) {
+        return nullptr;
+    }
+    
+    auto* state = static_cast<FetchState*>(JS_GetOpaque(state_val, js_fetch_state_class_id));
+    JS_FreeValue(ctx, state_val);
+    return state;
+}
+
 struct ReadableStreamData {
     std::shared_ptr<StreamState> state;
     bool locked = false;
@@ -624,11 +665,16 @@ static size_t stream_header_callback(char* buffer, size_t size, size_t nitems, v
         header.pop_back();
     }
     
-    // Empty line signals end of headers
+    // Empty line signals end of headers for current response
+    // But don't mark as received until we have a final (non-redirect) status
     if (header.empty()) {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->headers_received = true;
-        state->cv.notify_all();
+        // Only mark headers_received if this is a final response (not a redirect)
+        // Status codes 3xx are redirects that curl will follow
+        if (state->status_code < 300 || state->status_code >= 400) {
+            state->headers_received = true;
+            state->cv.notify_all();
+        }
         return size * nitems;
     }
     
@@ -640,6 +686,8 @@ static size_t stream_header_callback(char* buffer, size_t size, size_t nitems, v
             std::string status_str = header.substr(space1 + 1, space2 - space1 - 1);
             std::lock_guard<std::mutex> lock(state->mutex);
             state->status_code = std::stol(status_str);
+            // Reset headers on new status line (happens on redirect)
+            state->response_headers.clear();
         }
         return size * nitems;
     }
@@ -978,6 +1026,7 @@ struct FetchResponseData {
     std::unordered_map<std::string, std::string> headers;
     std::shared_ptr<StreamState> stream_state;  // For streaming responses
     bool is_streaming = false;
+    bool body_consumed = false;  // Track if body has been fully read
 };
 
 static void js_fetch_response_finalizer(JSRuntime* /*rt*/, JSValue val) {
@@ -990,10 +1039,39 @@ static JSClassDef js_fetch_response_class = {
     .finalizer = js_fetch_response_finalizer,
 };
 
+// Helper to consume streaming body into the body string
+static void consume_stream_body(FetchResponseData* data) {
+    if (!data || data->body_consumed || !data->stream_state) {
+        return;
+    }
+    
+    auto& state = data->stream_state;
+    
+    // Wait for all data to arrive
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&state] {
+            return state->done;
+        });
+        
+        // Collect all chunks into body
+        while (!state->chunks.empty()) {
+            data->body += state->chunks.front();
+            state->chunks.pop();
+        }
+    }
+    
+    data->body_consumed = true;
+}
+
 static JSValue js_fetch_response_json(JSContext* ctx, JSValueConst this_val,
                                       int /*argc*/, JSValueConst* /*argv*/) {
     auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
     if (!data) return JS_UNDEFINED;
+    
+    // Consume stream if needed
+    consume_stream_body(data);
+    
     return JS_ParseJSON(ctx, data->body.c_str(), data->body.size(), "<fetch-json>");
 }
 
@@ -1001,6 +1079,10 @@ static JSValue js_fetch_response_text(JSContext* ctx, JSValueConst this_val,
                                       int /*argc*/, JSValueConst* /*argv*/) {
     auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
     if (!data) return JS_UNDEFINED;
+    
+    // Consume stream if needed
+    consume_stream_body(data);
+    
     return JS_NewString(ctx, data->body.c_str());
 }
 
@@ -1247,47 +1329,23 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
         perform_streaming_fetch(stream_state);
     }).detach();
     
-    // Wait for headers to be received (this gives us status code)
-    {
-        std::unique_lock<std::mutex> lock(stream_state->mutex);
-        stream_state->cv.wait(lock, [&stream_state] {
-            return stream_state->headers_received || stream_state->done || stream_state->error;
-        });
-    }
-    
-    // Check for errors
-    if (stream_state->error) {
-        JSValue resolving_funcs[2];
-        JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-        JSValue error = JS_NewError(ctx);
-        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, stream_state->error_message.c_str()));
-        JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, &error);
-        JS_FreeValue(ctx, error);
-        JS_FreeValue(ctx, resolving_funcs[0]);
-        JS_FreeValue(ctx, resolving_funcs[1]);
-        return promise;
-    }
-    
-    // Create response object using our FetchResponse class
-    JSValue response_obj = JS_NewObjectClass(ctx, static_cast<int>(js_fetch_response_class_id));
-    auto* response_data = new FetchResponseData();
-    response_data->status_code = stream_state->status_code;
-    response_data->stream_state = stream_state;
-    response_data->is_streaming = true;
-    response_data->headers = stream_state->response_headers;
-    
-    JS_SetOpaque(response_obj, response_data);
-    
-    // Return a resolved Promise with the response
+    // Create promise that will be resolved when headers are received
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, response_obj);
         return promise;
     }
     
-    JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &response_obj);
-    JS_FreeValue(ctx, response_obj);
+    // Add to pending fetches for async processing
+    auto* fetch_state = get_fetch_state(ctx);
+    if (fetch_state) {
+        PendingFetch pending;
+        pending.stream_state = stream_state;
+        pending.resolve_func = JS_DupValue(ctx, resolving_funcs[0]);
+        pending.reject_func = JS_DupValue(ctx, resolving_funcs[1]);
+        pending.ctx = ctx;
+        fetch_state->pending.push_back(std::move(pending));
+    }
     
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
@@ -1500,13 +1558,103 @@ void setup_fetch(JSContext* ctx) {
     JS_NewClassID(&js_readable_stream_reader_class_id);
     JS_NewClass(JS_GetRuntime(ctx), js_readable_stream_reader_class_id, &js_readable_stream_reader_class);
     
+    // Register FetchState class for async fetch tracking
+    if (!fetch_class_registered) {
+        JS_NewClassID(&js_fetch_state_class_id);
+        fetch_class_registered = true;
+    }
+    JS_NewClass(JS_GetRuntime(ctx), js_fetch_state_class_id, &js_fetch_state_class);
+    
+    // Create and store fetch state on global object
+    JSValue fetch_state_obj = JS_NewObjectClass(ctx, static_cast<int>(js_fetch_state_class_id));
+    auto* fetch_state = new FetchState{};
+    JS_SetOpaque(fetch_state_obj, fetch_state);
+    
     // Register fetch functions
     JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "__fetch_state__", fetch_state_obj);
     JS_SetPropertyStr(ctx, global, "fetch",
         JS_NewCFunction(ctx, js_fetch, "fetch", 2));
     JS_SetPropertyStr(ctx, global, "fetchStream",
         JS_NewCFunction(ctx, js_fetch_stream, "fetchStream", 3));
     JS_FreeValue(ctx, global);
+}
+
+// Process pending fetch operations - called from event loop
+bool process_pending_fetches(JSContext* ctx) {
+    auto* state = get_fetch_state(ctx);
+    if (!state || state->pending.empty()) {
+        return false;
+    }
+    
+    bool processed_any = false;
+    
+    // Process each pending fetch
+    auto it = state->pending.begin();
+    while (it != state->pending.end()) {
+        auto& pending = *it;
+        auto& stream_state = pending.stream_state;
+        
+        bool ready = false;
+        bool has_error = false;
+        
+        {
+            std::lock_guard<std::mutex> lock(stream_state->mutex);
+            ready = stream_state->headers_received || stream_state->done;
+            has_error = stream_state->error;
+        }
+        
+        if (ready || has_error) {
+            // Resolve or reject the promise
+            if (has_error) {
+                JSValue error = JS_NewError(ctx);
+                JS_SetPropertyStr(ctx, error, "message", 
+                    JS_NewString(ctx, stream_state->error_message.c_str()));
+                JS_Call(ctx, pending.reject_func, JS_UNDEFINED, 1, &error);
+                JS_FreeValue(ctx, error);
+            } else {
+                // Create response object
+                JSValue response_obj = JS_NewObjectClass(ctx, static_cast<int>(js_fetch_response_class_id));
+                auto* response_data = new FetchResponseData();
+                response_data->status_code = stream_state->status_code;
+                response_data->stream_state = stream_state;
+                response_data->is_streaming = true;
+                response_data->headers = stream_state->response_headers;
+                JS_SetOpaque(response_obj, response_data);
+                
+                JS_Call(ctx, pending.resolve_func, JS_UNDEFINED, 1, &response_obj);
+                JS_FreeValue(ctx, response_obj);
+            }
+            
+            // Cleanup
+            JS_FreeValue(ctx, pending.resolve_func);
+            JS_FreeValue(ctx, pending.reject_func);
+            it = state->pending.erase(it);
+            processed_any = true;
+        } else {
+            ++it;
+        }
+    }
+    
+    return processed_any;
+}
+
+// Check if there are pending fetch operations
+bool has_pending_fetches(JSContext* ctx) {
+    auto* state = get_fetch_state(ctx);
+    return state && !state->pending.empty();
+}
+
+// Cleanup pending fetches when context is destroyed
+void cleanup_pending_fetches(JSContext* ctx) {
+    auto* state = get_fetch_state(ctx);
+    if (state) {
+        for (auto& pending : state->pending) {
+            JS_FreeValue(ctx, pending.resolve_func);
+            JS_FreeValue(ctx, pending.reject_func);
+        }
+        state->pending.clear();
+    }
 }
 
 // ============================================================================
