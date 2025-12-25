@@ -10,6 +10,7 @@ struct HttpRequest;
 namespace quickwork::bindings {
 
 void setup_console(JSContext* ctx);
+void setup_crypto(JSContext* ctx);
 void setup_request_class(JSContext* ctx);
 void setup_response_class(JSContext* ctx);
 void setup_fetch(JSContext* ctx);

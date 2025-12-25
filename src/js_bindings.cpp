@@ -6,6 +6,7 @@ extern "C" {
 }
 
 #include <curl/curl.h>
+#include <openssl/rand.h>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -61,6 +62,89 @@ void setup_console(JSContext* ctx) {
         JS_NewCFunction(ctx, js_console_error, "error", 1));
 
     JS_SetPropertyStr(ctx, global, "console", console);
+    JS_FreeValue(ctx, global);
+}
+
+// ============================================================================
+// Crypto API implementation (crypto.getRandomValues)
+// ============================================================================
+
+static JSValue js_crypto_getRandomValues(JSContext* ctx, JSValueConst /*this_val*/,
+                                          int argc, JSValueConst* argv)
+{
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "crypto.getRandomValues requires 1 argument");
+    }
+
+    // Must be a TypedArray (Uint8Array, Uint16Array, Uint32Array, etc.)
+    size_t byte_offset = 0;
+    size_t byte_length = 0;
+    size_t bytes_per_element = 0;
+    
+    JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_length, &bytes_per_element);
+    if (JS_IsException(buffer)) {
+        return JS_ThrowTypeError(ctx, "crypto.getRandomValues: argument must be a TypedArray");
+    }
+    
+    // Get the underlying buffer data
+    size_t buffer_size = 0;
+    uint8_t* buf = JS_GetArrayBuffer(ctx, &buffer_size, buffer);
+    JS_FreeValue(ctx, buffer);
+    
+    if (!buf) {
+        return JS_ThrowTypeError(ctx, "crypto.getRandomValues: failed to get array buffer");
+    }
+    
+    // Check quota (max 65536 bytes as per Web Crypto spec)
+    if (byte_length > 65536) {
+        return JS_ThrowRangeError(ctx, "crypto.getRandomValues: quota exceeded (max 65536 bytes)");
+    }
+    
+    // Fill with random bytes using OpenSSL
+    if (RAND_bytes(buf + byte_offset, static_cast<int>(byte_length)) != 1) {
+        return JS_ThrowInternalError(ctx, "crypto.getRandomValues: failed to generate random bytes");
+    }
+    
+    // Return the same array (as per spec)
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue js_crypto_randomUUID(JSContext* ctx, JSValueConst /*this_val*/,
+                                     int /*argc*/, JSValueConst* /*argv*/)
+{
+    // Generate a UUID v4
+    uint8_t bytes[16];
+    if (RAND_bytes(bytes, 16) != 1) {
+        return JS_ThrowInternalError(ctx, "crypto.randomUUID: failed to generate random bytes");
+    }
+    
+    // Set version (4) and variant (RFC 4122)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;  // Version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;  // Variant 1
+    
+    // Format as UUID string
+    char uuid_str[37];
+    snprintf(uuid_str, sizeof(uuid_str),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3],
+             bytes[4], bytes[5],
+             bytes[6], bytes[7],
+             bytes[8], bytes[9],
+             bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    
+    return JS_NewString(ctx, uuid_str);
+}
+
+void setup_crypto(JSContext* ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue crypto = JS_NewObject(ctx);
+    
+    JS_SetPropertyStr(ctx, crypto, "getRandomValues",
+        JS_NewCFunction(ctx, js_crypto_getRandomValues, "getRandomValues", 1));
+    JS_SetPropertyStr(ctx, crypto, "randomUUID",
+        JS_NewCFunction(ctx, js_crypto_randomUUID, "randomUUID", 0));
+    
+    JS_SetPropertyStr(ctx, global, "crypto", crypto);
     JS_FreeValue(ctx, global);
 }
 

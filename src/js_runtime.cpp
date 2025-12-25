@@ -92,6 +92,7 @@ JsContext& JsContext::operator=(JsContext&& other) noexcept {
 
 void JsContext::setup_bindings() {
     bindings::setup_console(ctx_);
+    bindings::setup_crypto(ctx_);
     bindings::setup_request_class(ctx_);
     bindings::setup_response_class(ctx_);
     bindings::setup_fetch(ctx_);
