@@ -1,21 +1,18 @@
 # QuickWork
 
-A modern C++ web server with a multithreaded QuickJS runtime for executing JavaScript handlers.
+A minimalist serverless QuickJS runtime.
 
 ## Features
 
-- Multithreaded QuickJS runtime (one runtime per thread)
-- New JS context per request for isolation
-- Support for sync and async handlers
+- Near instant cold starts
+- Multithreaded QuickJS runtime with request isolation
 - Configurable memory and CPU limits per request
-- Handler caching to disk
-- Modern C++20 with Boost.Beast HTTP server
 
 ## Building
 
 Requirements:
 - CMake 3.20+
-- C++20 compatible compiler
+- Modern C++ compiler
 - OpenSSL
 
 ```bash
@@ -65,6 +62,8 @@ curl http://localhost:8080 -H "x-handler-id: abc123..."
 
 ## Handler API
 
+Handlers are JavaScript functions that receive a Request and return a Response. QuickWork compiles handlers to bytecode on registration for fast execution.
+
 ### Request Object
 
 Handlers receive a Request object with:
@@ -76,39 +75,105 @@ Handlers receive a Request object with:
 
 ### Response Object
 
-Create responses using:
+Create responses using the Response constructor:
 
 ```javascript
 // Simple text response
 new Response("Hello, World!")
 
-// With options
-new Response("Not Found", { status: 404 })
+// With status and headers
+new Response("Not Found", { 
+  status: 404,
+  headers: { "content-type": "text/plain" }
+})
 
-// JSON response
+// JSON helper
 Response.json({ data: "value" })
-
-// With status
 Response.json({ error: "Bad Request" }, { status: 400 })
 ```
 
-### Examples
+### Fetch API
 
-Sync handler:
+Make HTTP requests from handlers using the standard `fetch` API:
+
 ```javascript
-export default function(req) {
-  return Response.json({
-    method: req.method,
-    url: req.url
+export default async function(req) {
+  const response = await fetch("https://api.example.com/data", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: "value" })
   });
+  
+  const data = await response.json();
+  return Response.json(data);
 }
 ```
 
-Async handler:
+The fetch response object includes:
+- `status` - HTTP status code
+- `ok` - Boolean indicating success (status 200-299)
+- `body` - Response body as string
+- `json()` - Parse body as JSON
+- `text()` - Get body as string
+
+### Timers
+
+Use `setTimeout` for delayed execution:
+
 ```javascript
 export default async function(req) {
-  const data = req.json();
-  return Response.json({ received: data });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  return new Response("Waited 100ms");
+}
+```
+
+### Crypto API
+
+Web Crypto API for generating random values and UUIDs:
+
+```javascript
+export default function(req) {
+  // Generate a UUID
+  const id = crypto.randomUUID();
+  
+  // Generate random bytes
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  
+  return Response.json({ id, bytes: Array.from(bytes) });
+}
+```
+
+### ESM Imports from esm.sh
+
+Import npm packages directly from [esm.sh](https://esm.sh) at compile time:
+
+```javascript
+import { nanoid } from "https://esm.sh/nanoid";
+
+export default function(req) {
+  return Response.json({ id: nanoid() });
+}
+```
+
+```javascript
+import { v4 as uuidv4 } from "https://esm.sh/uuid";
+
+export default function(req) {
+  return Response.json({ id: uuidv4() });
+}
+```
+
+Modules are fetched and bundled during handler registration, so there's no runtime overhead. Transitive dependencies are automatically resolved.
+
+### Console
+
+Use `console.log`, `console.warn`, and `console.error` for debugging (output goes to server stderr):
+
+```javascript
+export default function(req) {
+  console.log("Request received:", req.method, req.url);
+  return new Response("OK");
 }
 ```
 
@@ -197,40 +262,16 @@ docker run -d -p 8080:8080 \
 
 ### Health Check
 
-You can add a health check to your container:
+QuickWork provides a built-in health check endpoint at `GET /health`:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
+```
+
+You can use this in your Dockerfile:
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD curl -f http://localhost:8080 -H "x-handler-id: healthcheck" || exit 1
+    CMD curl -f http://localhost:8080/health || exit 1
 ```
-
-## Architecture
-
-```
-                    +------------------+
-                    |   HTTP Server    |
-                    | (Boost.Beast)    |
-                    +--------+---------+
-                             |
-              +--------------+--------------+
-              |                             |
-    +---------v---------+         +---------v---------+
-    |    Thread Pool    |         |   Handler Store   |
-    |                   |         |                   |
-    | +---------------+ |         | - SHA256 hash ID  |
-    | | QuickJS RT 1  | |         | - Disk cache      |
-    | +---------------+ |         | - Memory cache    |
-    | +---------------+ |         +-------------------+
-    | | QuickJS RT 2  | |
-    | +---------------+ |
-    | +---------------+ |
-    | | QuickJS RT N  | |
-    | +---------------+ |
-    +-------------------+
-```
-
-Each worker thread has its own QuickJS runtime. Each request gets a fresh context within that runtime, ensuring isolation between requests while reusing the compiled bytecode when possible.
-
-## License
-
-MIT

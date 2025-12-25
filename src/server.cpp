@@ -57,6 +57,18 @@ private:
     }
 
     void handle_request() {
+        // Health check endpoint
+        if (request_.method() == http::verb::get && request_.target() == "/health") {
+            http::response<http::string_body> res{http::status::ok, request_.version()};
+            res.set(http::field::server, "quickwork");
+            res.set(http::field::content_type, "application/json");
+            res.keep_alive(request_.keep_alive());
+            res.body() = R"({"status":"ok"})";
+            res.prepare_payload();
+            send_response(std::move(res));
+            return;
+        }
+
         // Check for handler-id header
         auto handler_id_it = request_.find("x-handler-id");
 
