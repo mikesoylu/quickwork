@@ -1,10 +1,9 @@
 #pragma once
 
 #include "config.hpp"
+#include "handler_store.hpp"
 
-#include <atomic>
 #include <chrono>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -51,7 +50,7 @@ public:
     JsContext& operator=(JsContext&&) noexcept;
 
     [[nodiscard]] ExecutionResult execute_handler(
-        std::string_view source,
+        const Bytecode& bytecode,
         const HttpRequest& request
     );
 

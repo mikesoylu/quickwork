@@ -3,8 +3,13 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 
 #include <openssl/sha.h>
+
+extern "C" {
+#include "quickjs.h"
+}
 
 namespace quickwork {
 
@@ -14,7 +19,7 @@ namespace quickwork {
 
 LRUCache::LRUCache(size_t capacity) : capacity_(capacity) {}
 
-std::optional<std::string> LRUCache::get(const std::string& key) {
+std::optional<Bytecode> LRUCache::get(const std::string& key) {
     std::unique_lock lock(mutex_);
     
     auto it = index_.find(key);
@@ -27,7 +32,7 @@ std::optional<std::string> LRUCache::get(const std::string& key) {
     return it->second->second;
 }
 
-void LRUCache::put(const std::string& key, std::string value) {
+void LRUCache::put(const std::string& key, Bytecode value) {
     std::unique_lock lock(mutex_);
     
     auto it = index_.find(key);
@@ -90,10 +95,72 @@ std::string HandlerStore::compute_hash(std::string_view source) {
 }
 
 std::filesystem::path HandlerStore::get_handler_path(std::string_view id) const {
-    return cache_dir_ / (std::string(id) + ".js");
+    return cache_dir_ / (std::string(id) + ".qjbc");
 }
 
-std::string HandlerStore::store(std::string_view source) {
+Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view source) {
+    // Create a temporary context for compilation
+    JSContext* ctx = JS_NewContext(rt);
+    if (!ctx) {
+        throw std::runtime_error("Failed to create context for bytecode compilation");
+    }
+
+    // Transform "export default" to a form QuickJS can handle
+    std::string source_str(source);
+    std::string transformed = source_str;
+    
+    size_t pos = transformed.find("export default function");
+    if (pos != std::string::npos) {
+        transformed.replace(pos, 23, "__handler__ = function");
+    } else {
+        pos = transformed.find("export default async function");
+        if (pos != std::string::npos) {
+            transformed.replace(pos, 29, "__handler__ = async function");
+        } else {
+            pos = transformed.find("export default");
+            if (pos != std::string::npos) {
+                transformed.replace(pos, 14, "__handler__ =");
+            }
+        }
+    }
+
+    // Prepend variable declaration
+    std::string setup_code = "var __handler__;\n" + transformed;
+
+    // Compile to bytecode (JS_EVAL_FLAG_COMPILE_ONLY returns function object without executing)
+    JSValue obj = JS_Eval(ctx, setup_code.c_str(), setup_code.size(),
+                          "<handler>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+
+    if (JS_IsException(obj)) {
+        JSValue exc = JS_GetException(ctx);
+        const char* err_str = JS_ToCString(ctx, exc);
+        std::string error_msg = err_str ? err_str : "Unknown compilation error";
+        if (err_str) JS_FreeCString(ctx, err_str);
+        JS_FreeValue(ctx, exc);
+        JS_FreeContext(ctx);
+        throw std::runtime_error("Failed to compile handler: " + error_msg);
+    }
+
+    // Write object to bytecode
+    size_t bytecode_len = 0;
+    uint8_t* bytecode_buf = JS_WriteObject(ctx, &bytecode_len, obj, JS_WRITE_OBJ_BYTECODE);
+    
+    JS_FreeValue(ctx, obj);
+    JS_FreeContext(ctx);
+
+    if (!bytecode_buf) {
+        throw std::runtime_error("Failed to serialize bytecode");
+    }
+
+    // Copy to Bytecode struct
+    Bytecode bc;
+    bc.data.assign(bytecode_buf, bytecode_buf + bytecode_len);
+    js_free_rt(rt, bytecode_buf);
+
+    return bc;
+}
+
+std::string HandlerStore::store(::JSRuntime* rt, std::string_view source) {
     std::string id = compute_hash(source);
 
     // Check cache first
@@ -101,24 +168,43 @@ std::string HandlerStore::store(std::string_view source) {
         return id;
     }
 
-    // Write to disk
+    // Check if bytecode file exists on disk
     auto path = get_handler_path(id);
-    if (!std::filesystem::exists(path)) {
-        std::ofstream file(path, std::ios::binary);
-        if (!file) {
-            throw std::runtime_error("Failed to write handler to disk: " + path.string());
+    if (std::filesystem::exists(path)) {
+        // Load from disk and cache
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (file) {
+            auto size = file.tellg();
+            file.seekg(0);
+            
+            Bytecode bc;
+            bc.data.resize(static_cast<size_t>(size));
+            file.read(reinterpret_cast<char*>(bc.data.data()), size);
+            
+            cache_.put(id, std::move(bc));
+            return id;
         }
-        file.write(source.data(), static_cast<std::streamsize>(source.size()));
-        file.close();
     }
 
+    // Compile to bytecode
+    Bytecode bc = compile_to_bytecode(rt, source);
+
+    // Write bytecode to disk
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Failed to write bytecode to disk: " + path.string());
+    }
+    file.write(reinterpret_cast<const char*>(bc.data.data()),
+               static_cast<std::streamsize>(bc.data.size()));
+    file.close();
+
     // Cache in memory
-    cache_.put(id, std::string(source));
+    cache_.put(id, std::move(bc));
 
     return id;
 }
 
-std::optional<std::string> HandlerStore::load(std::string_view id) {
+std::optional<Bytecode> HandlerStore::load(std::string_view id) {
     std::string id_str(id);
     
     // Try cache first (also updates LRU order)
@@ -141,13 +227,14 @@ std::optional<std::string> HandlerStore::load(std::string_view id) {
     auto size = file.tellg();
     file.seekg(0);
 
-    std::string content(static_cast<size_t>(size), '\0');
-    file.read(content.data(), size);
+    Bytecode bc;
+    bc.data.resize(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(bc.data.data()), size);
 
     // Cache it
-    cache_.put(id_str, content);
+    cache_.put(id_str, bc);
 
-    return content;
+    return bc;
 }
 
 bool HandlerStore::exists(std::string_view id) const {

@@ -21,8 +21,9 @@ namespace {
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(tcp::socket socket, HandlerStore& store, ThreadPool& pool)
+    Session(tcp::socket socket, Server& server, HandlerStore& store, ThreadPool& pool)
         : stream_(std::move(socket))
+        , server_(server)
         , handler_store_(store)
         , thread_pool_(pool)
     {
@@ -79,7 +80,7 @@ private:
                 return;
             }
 
-            std::string id = handler_store_.store(source);
+            std::string id = server_.store_handler(source);
 
             http::response<http::string_body> res{http::status::ok, request_.version()};
             res.set(http::field::server, "quickwork");
@@ -95,8 +96,8 @@ private:
     }
 
     void handle_execute(const std::string& handler_id) {
-        auto source_opt = handler_store_.load(handler_id);
-        if (!source_opt) {
+        auto bytecode_opt = handler_store_.load(handler_id);
+        if (!bytecode_opt) {
             send_error(404, "Handler not found");
             return;
         }
@@ -112,16 +113,15 @@ private:
                 std::string(field.value());
         }
 
-        std::string source = *source_opt;
-        std::string url = js_request.url;
+        Bytecode bytecode = std::move(*bytecode_opt);
 
         // Execute on thread pool with callback
         auto self = shared_from_this();
         thread_pool_.enqueue_with_callback(
-            [source = std::move(source), js_request = std::move(js_request)]
+            [bytecode = std::move(bytecode), js_request = std::move(js_request)]
             (JsRuntime& runtime) -> ExecutionResult {
                 auto ctx = runtime.create_context();
-                return ctx.execute_handler(source, js_request);
+                return ctx.execute_handler(bytecode, js_request);
             },
             [self](ExecutionResult result) {
                 if (result.response) {
@@ -208,6 +208,7 @@ private:
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
+    Server& server_;
     HandlerStore& handler_store_;
     ThreadPool& thread_pool_;
 };
@@ -215,9 +216,10 @@ private:
 class Listener : public std::enable_shared_from_this<Listener> {
 public:
     Listener(net::io_context& ioc, tcp::endpoint endpoint,
-             HandlerStore& store, ThreadPool& pool)
+             Server& server, HandlerStore& store, ThreadPool& pool)
         : ioc_(ioc)
         , acceptor_(net::make_strand(ioc))
+        , server_(server)
         , handler_store_(store)
         , thread_pool_(pool)
     {
@@ -259,7 +261,7 @@ private:
         if (ec) {
             std::cerr << "Accept error: " << ec.message() << "\n";
         } else {
-            std::make_shared<Session>(std::move(socket), handler_store_, thread_pool_)->run();
+            std::make_shared<Session>(std::move(socket), server_, handler_store_, thread_pool_)->run();
         }
 
         do_accept();
@@ -267,6 +269,7 @@ private:
 
     net::io_context& ioc_;
     tcp::acceptor acceptor_;
+    Server& server_;
     HandlerStore& handler_store_;
     ThreadPool& thread_pool_;
 };
@@ -275,6 +278,7 @@ private:
 
 Server::Server(const Config& config)
     : config_(config)
+    , compiler_runtime_(std::make_unique<JsRuntime>(config_))
     , handler_store_(std::make_unique<HandlerStore>(config_))
     , thread_pool_(std::make_unique<ThreadPool>(config_))
 {
@@ -284,6 +288,11 @@ Server::~Server() {
     stop();
 }
 
+std::string Server::store_handler(std::string_view source) {
+    std::lock_guard<std::mutex> lock(compiler_mutex_);
+    return handler_store_->store(compiler_runtime_->get(), source);
+}
+
 void Server::run() {
     running_ = true;
 
@@ -291,7 +300,7 @@ void Server::run() {
 
     auto endpoint = tcp::endpoint{net::ip::make_address(config_.host), config_.port};
 
-    std::make_shared<Listener>(ioc, endpoint, *handler_store_, *thread_pool_)->run();
+    std::make_shared<Listener>(ioc, endpoint, *this, *handler_store_, *thread_pool_)->run();
 
     std::cout << "Server listening on " << config_.host << ":" << config_.port << "\n";
 

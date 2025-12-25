@@ -1,4 +1,5 @@
 #include "js_runtime.hpp"
+#include "handler_store.hpp"
 #include "js_bindings.hpp"
 
 #include <chrono>
@@ -283,7 +284,7 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
 }
 
 ExecutionResult JsContext::execute_handler(
-    std::string_view source,
+    const Bytecode& bytecode,
     const HttpRequest& request)
 {
     ExecutionResult exec_result;
@@ -294,30 +295,17 @@ ExecutionResult JsContext::execute_handler(
     JS_SetPropertyStr(ctx_, global, "__request__", request_obj);
     JS_FreeValue(ctx_, global);
 
-    // Transform "export default" to a form QuickJS can handle
-    std::string source_str(source);
+    // Load bytecode - this returns the compiled function object
+    JSValue obj = JS_ReadObject(ctx_, bytecode.ptr(), bytecode.size(), JS_READ_OBJ_BYTECODE);
     
-    // Replace "export default function" with assignment
-    std::string transformed = source_str;
-    size_t pos = transformed.find("export default function");
-    if (pos != std::string::npos) {
-        transformed.replace(pos, 23, "__handler__ = function");
-    } else {
-        pos = transformed.find("export default async function");
-        if (pos != std::string::npos) {
-            transformed.replace(pos, 29, "__handler__ = async function");
-        } else {
-            pos = transformed.find("export default");
-            if (pos != std::string::npos) {
-                transformed.replace(pos, 14, "__handler__ =");
-            }
-        }
+    if (JS_IsException(obj)) {
+        handle_exception();
+        exec_result.error = error_message_;
+        return exec_result;
     }
 
-    // First, evaluate the handler definition
-    std::string setup_code = "var __handler__;\n" + transformed;
-    JSValue setup_result = JS_Eval(ctx_, setup_code.c_str(), setup_code.size(),
-                                   "<handler-setup>", JS_EVAL_TYPE_GLOBAL);
+    // Evaluate the loaded bytecode (executes the compiled script, setting up __handler__)
+    JSValue setup_result = JS_EvalFunction(ctx_, obj);
     
     if (JS_IsException(setup_result)) {
         handle_exception();
@@ -326,7 +314,7 @@ ExecutionResult JsContext::execute_handler(
     }
     JS_FreeValue(ctx_, setup_result);
 
-    // Then call the handler
+    // Call the handler
     std::string call_code = R"(
         (function() {
             if (typeof __handler__ !== 'function') {
