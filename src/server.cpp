@@ -115,7 +115,7 @@ private:
     void handle_execute(const std::string& handler_id) {
         auto bytecode_opt = handler_store_.load(handler_id);
         if (!bytecode_opt) {
-            send_error(404, "Handler not found");
+            send_error(404, "Handler not found", true);
             return;
         }
 
@@ -299,6 +299,10 @@ private:
                 lower_key == "transfer-encoding" || lower_key == "content-length") {
                 continue;
             }
+            // Strip server-exclusive header to prevent handlers from forging it
+            if (lower_key == "x-qw-handler-not-found") {
+                continue;
+            }
             res.set(key, value);
         }
 
@@ -308,13 +312,16 @@ private:
         send_response(std::move(res));
     }
 
-    void send_error(unsigned status, std::string_view message) {
+    void send_error(unsigned status, std::string_view message, bool handler_not_found = false) {
         http::response<http::string_body> res{
             static_cast<http::status>(status),
             request_.version()
         };
         res.set(http::field::server, "quickwork");
         res.set(http::field::content_type, "application/json");
+        if (handler_not_found) {
+            res.set("x-qw-handler-not-found", "true");
+        }
         res.keep_alive(request_.keep_alive());
         res.body() = R"({"error":")" + std::string(message) + R"("})";
         res.prepare_payload();

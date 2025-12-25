@@ -917,6 +917,41 @@ test_unknown_handler_id() {
     assert_contains "$response" "error" || assert_contains "$response" "not found"
 }
 
+# Test: Handler not found returns x-qw-handler-not-found header
+test_handler_not_found_header() {
+    local response
+    response=$(curl -s -i -H "x-handler-id: nonexistent-id-12345" "${BASE_URL}/")
+    
+    assert_contains "$response" "x-qw-handler-not-found: true"
+}
+
+# Test: Handler cannot forge x-qw-handler-not-found header
+test_handler_cannot_forge_not_found_header() {
+    local handler='export default function(req) {
+        return new Response("Fake not found", {
+            status: 404,
+            headers: { "x-qw-handler-not-found": "true" }
+        });
+    }'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler_with_headers "$id")
+    
+    # Response should NOT contain the x-qw-handler-not-found header
+    # (it gets stripped from handler responses)
+    if [[ "$response" == *"x-qw-handler-not-found"* ]]; then
+        log_debug "Handler was able to forge x-qw-handler-not-found header!"
+        return 1
+    fi
+    
+    # But it should still have the handler's body
+    assert_contains "$response" "Fake not found"
+}
+
 # Test: ESM default import (requires network - skip if no connection)
 test_esm_import_default() {
     # Check network connectivity first
@@ -2197,6 +2232,8 @@ main() {
     run_test "Health endpoint" test_health_endpoint
     run_test "Missing handler ID" test_missing_handler_id
     run_test "Unknown handler ID" test_unknown_handler_id
+    run_test "Handler not found header" test_handler_not_found_header
+    run_test "Handler cannot forge not-found header" test_handler_cannot_forge_not_found_header
     
     log_section "Edge Case Tests"
     run_test "Deep recursion (fib 25)" test_deep_recursion
