@@ -33,6 +33,8 @@ FROM alpine:3.20
 RUN apk add --no-cache \
     libcurl \
     libstdc++ \
+    libssl3 \
+    libcrypto3 \
     ca-certificates
 
 # Copy the binary

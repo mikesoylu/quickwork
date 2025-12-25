@@ -77,7 +77,8 @@ JsRuntime::JsRuntime(const Config& config) : config_(config) {
     }
 
     JS_SetMemoryLimit(rt_, config_.get_max_memory_bytes());
-    JS_SetMaxStackSize(rt_, 256 * 1024);  // 256KB stack
+    // Don't set stack size - let QuickJS auto-detect
+    // JS_SetMaxStackSize can cause issues on musl/Alpine
     JS_SetInterruptHandler(rt_, interrupt_handler, nullptr);
 }
 
@@ -88,6 +89,9 @@ JsRuntime::~JsRuntime() {
 }
 
 JsContext JsRuntime::create_context() {
+    // Update stack top for the current thread - worker threads have different
+    // stack addresses than the thread where the runtime was created
+    JS_UpdateStackTop(rt_);
     return JsContext(rt_, config_);
 }
 

@@ -101,6 +101,12 @@ std::filesystem::path HandlerStore::get_handler_path(std::string_view id) const 
 }
 
 Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view source) {
+    // CRITICAL: Update stack top for current thread. The runtime was created on
+    // a different thread (main), but compilation happens on HTTP handler threads.
+    // Without this, QuickJS's stack overflow check fails because it compares
+    // against the wrong stack base.
+    JS_UpdateStackTop(rt);
+    
     // Create a temporary context for compilation
     JSContext* ctx = JS_NewContext(rt);
     if (!ctx) {
@@ -161,6 +167,7 @@ Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view sou
                 JS_FreeCString(ctx, stack_str);
             }
         }
+        
         JS_FreeValue(ctx, stack);
         JS_FreeValue(ctx, exc);
         JS_FreeContext(ctx);
