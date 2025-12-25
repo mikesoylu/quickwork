@@ -1,7 +1,9 @@
 #include "handler_store.hpp"
+#include "module_resolver.hpp"
 
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -105,9 +107,18 @@ Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view sou
         throw std::runtime_error("Failed to create context for bytecode compilation");
     }
 
+    // Resolve and bundle ESM imports
+    ModuleResolver resolver;
+    std::string bundled_source;
+    try {
+        bundled_source = resolver.resolve_and_bundle(source);
+    } catch (const std::exception& e) {
+        JS_FreeContext(ctx);
+        throw std::runtime_error(std::string("Module resolution failed: ") + e.what());
+    }
+
     // Transform "export default" to a form QuickJS can handle
-    std::string source_str(source);
-    std::string transformed = source_str;
+    std::string transformed = bundled_source;
     
     size_t pos = transformed.find("export default function");
     if (pos != std::string::npos) {
@@ -133,11 +144,29 @@ Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view sou
 
     if (JS_IsException(obj)) {
         JSValue exc = JS_GetException(ctx);
+        std::ostringstream error_oss;
+        
         const char* err_str = JS_ToCString(ctx, exc);
-        std::string error_msg = err_str ? err_str : "Unknown compilation error";
-        if (err_str) JS_FreeCString(ctx, err_str);
+        if (err_str) {
+            error_oss << err_str;
+            JS_FreeCString(ctx, err_str);
+        }
+        
+        // Also get stack trace if available
+        JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+        if (!JS_IsUndefined(stack)) {
+            const char* stack_str = JS_ToCString(ctx, stack);
+            if (stack_str) {
+                error_oss << "\nStack: " << stack_str;
+                JS_FreeCString(ctx, stack_str);
+            }
+        }
+        JS_FreeValue(ctx, stack);
         JS_FreeValue(ctx, exc);
         JS_FreeContext(ctx);
+        
+        std::string error_msg = error_oss.str();
+        if (error_msg.empty()) error_msg = "Unknown compilation error";
         throw std::runtime_error("Failed to compile handler: " + error_msg);
     }
 

@@ -94,6 +94,7 @@ add_executable(quickwork
     src/js_runtime.cpp
     src/js_bindings.cpp
     src/thread_pool.cpp
+    src/module_resolver.cpp
 )
 
 target_include_directories(quickwork 
