@@ -20,7 +20,40 @@ FetchContent_MakeAvailable(Boost)
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(CURL REQUIRED)
+
+# For static builds, manually specify all static libraries with linker group
+option(BUILD_STATIC "Build static binary" OFF)
+if(BUILD_STATIC)
+    # Use linker group to resolve circular dependencies between static libraries
+    # Include SSL/Crypto in the group since curl depends on them
+    # Note: libz.a is in /lib/ on Alpine, not /usr/lib/
+    set(CURL_LIBRARIES
+        -Wl,--start-group
+        /usr/lib/libcurl.a
+        /usr/lib/libssl.a
+        /usr/lib/libcrypto.a
+        /usr/lib/libcares.a
+        /usr/lib/libnghttp2.a
+        /usr/lib/libpsl.a
+        /usr/lib/libidn2.a
+        /usr/lib/libunistring.a
+        /usr/lib/libzstd.a
+        /usr/lib/libbrotlidec.a
+        /usr/lib/libbrotlicommon.a
+        /lib/libz.a
+        -Wl,--end-group
+    )
+    
+    find_path(CURL_INCLUDE_DIR curl/curl.h)
+    message(STATUS "Static CURL libraries: ${CURL_LIBRARIES}")
+    
+    # Override OpenSSL to avoid duplicate linking
+    set(OPENSSL_CRYPTO_LIBRARY "")
+    set(OPENSSL_SSL_LIBRARY "")
+else()
+    find_package(CURL REQUIRED)
+    set(CURL_LIBRARIES CURL::libcurl)
+endif()
 
 # Fetch QuickJS from bellard.org
 FetchContent_Declare(
@@ -68,18 +101,35 @@ target_include_directories(quickwork
     SYSTEM PRIVATE ${QUICKJS_INCLUDE_DIR}
 )
 
-target_link_libraries(quickwork PRIVATE
-    quickjs_lib
-    Boost::beast
-    Boost::asio
-    Boost::program_options
-    Threads::Threads
-    OpenSSL::Crypto
-    OpenSSL::SSL
-    CURL::libcurl
-    ${CMAKE_DL_LIBS}
-)
+target_include_directories(quickwork PRIVATE ${CURL_INCLUDE_DIR})
 
+if(BUILD_STATIC)
+    # For static builds, all libraries are in CURL_LIBRARIES with proper link group
+    target_link_libraries(quickwork PRIVATE
+        quickjs_lib
+        Boost::beast
+        Boost::asio
+        Boost::program_options
+        Threads::Threads
+        ${CURL_LIBRARIES}
+        ${CMAKE_DL_LIBS}
+    )
+else()
+    target_link_libraries(quickwork PRIVATE
+        quickjs_lib
+        Boost::beast
+        Boost::asio
+        Boost::program_options
+        Threads::Threads
+        OpenSSL::Crypto
+        OpenSSL::SSL
+        ${CURL_LIBRARIES}
+        ${CMAKE_DL_LIBS}
+    )
+endif()
+
+# Compiler warnings
+# Use -fpermissive to allow QuickJS macros that mix designated/non-designated initializers
 target_compile_options(quickwork PRIVATE
-    -Wall -Wextra -Wpedantic
+    -Wall -Wextra -fpermissive
 )

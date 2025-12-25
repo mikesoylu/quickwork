@@ -7,10 +7,12 @@ extern "C" {
 
 #include <curl/curl.h>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 namespace quickwork::bindings {
 
@@ -71,7 +73,7 @@ static void js_request_finalizer(JSRuntime* /*rt*/, JSValue val) {
 }
 
 static JSClassDef js_request_class = {
-    "Request",
+    .class_name = "Request",
     .finalizer = js_request_finalizer,
 };
 
@@ -146,7 +148,7 @@ static void js_response_finalizer(JSRuntime* /*rt*/, JSValue /*val*/) {
 }
 
 static JSClassDef js_response_class = {
-    "Response",
+    .class_name = "Response",
     .finalizer = js_response_finalizer,
 };
 
@@ -254,7 +256,7 @@ static void js_fetch_response_finalizer(JSRuntime* /*rt*/, JSValue val) {
 }
 
 static JSClassDef js_fetch_response_class = {
-    "FetchResponse",
+    .class_name = "FetchResponse",
     .finalizer = js_fetch_response_finalizer,
 };
 
@@ -580,7 +582,7 @@ static void js_timer_state_finalizer(JSRuntime* /*rt*/, JSValue val) {
 }
 
 static JSClassDef js_timer_state_class = {
-    "TimerState",
+    .class_name = "TimerState",
     .finalizer = js_timer_state_finalizer,
 };
 
