@@ -40,6 +40,8 @@ int main(int argc, char* argv[]) {
             "Max CPU time per request in ms")
         ("threads,j", po::value<size_t>(&config.thread_count)->default_value(0),
             "Number of worker threads (0 = auto)")
+        ("cache-size,s", po::value<size_t>(&config.handler_cache_size)->default_value(1024),
+            "Max handlers in memory cache (LRU)")
     ;
 
     po::variables_map vm;
@@ -78,6 +80,7 @@ int main(int argc, char* argv[]) {
     std::cout << "QuickWork v1.0.0\n";
     std::cout << "===============\n";
     std::cout << "Cache directory: " << config.cache_dir << "\n";
+    std::cout << "Handler cache: " << config.handler_cache_size << " entries\n";
     std::cout << "Max memory: " << config.max_memory_mb << " MB\n";
     std::cout << "Max CPU time: " << config.max_cpu_time_ms << " ms\n";
     std::cout << "Threads: " << (config.thread_count == 0 ? std::thread::hardware_concurrency() : config.thread_count) << "\n\n";

@@ -15,6 +15,7 @@ struct Config {
     size_t max_memory_mb = 64;
     uint32_t max_cpu_time_ms = 5000;
     size_t thread_count = 0;  // 0 = hardware concurrency
+    size_t handler_cache_size = 1024;  // Max handlers in memory cache
 
     [[nodiscard]] size_t get_thread_count() const noexcept {
         return thread_count == 0 ? std::thread::hardware_concurrency() : thread_count;
