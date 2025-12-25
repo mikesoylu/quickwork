@@ -351,7 +351,9 @@ static JSValue js_stream_response_write(JSContext* ctx, JSValueConst this_val,
     if (argc >= 1) {
         const char* chunk = JS_ToCString(ctx, argv[0]);
         if (chunk) {
-            data->chunks.push_back(chunk);
+            if (data->writer) {
+                data->writer(chunk);
+            }
             JS_FreeCString(ctx, chunk);
         }
     }
@@ -368,12 +370,18 @@ static JSValue js_stream_response_close(JSContext* ctx, JSValueConst this_val,
     return JS_DupValue(ctx, this_val);
 }
 
+// Forward declaration
+quickwork::StreamWriter get_current_stream_writer();
+
 static JSValue js_stream_response_constructor(JSContext* ctx, JSValueConst /*new_target*/,
                                               int argc, JSValueConst* argv) {
     JSValue obj = JS_NewObjectClass(ctx, js_stream_response_class_id);
     if (JS_IsException(obj)) return obj;
     
     auto* data = new StreamResponseData();
+    
+    // Get the stream writer for this context
+    data->writer = get_current_stream_writer();
     
     // Default SSE headers
     data->headers["Content-Type"] = "text/event-stream";
@@ -503,7 +511,9 @@ static JSValue js_stream_response_send_event(JSContext* ctx, JSValueConst this_v
     }
     
     event += "\n";  // End of event
-    data->chunks.push_back(event);
+    if (data->writer) {
+        data->writer(event);
+    }
     
     return JS_DupValue(ctx, this_val);
 }
@@ -537,8 +547,19 @@ void setup_stream_response_class(JSContext* ctx) {
 }
 
 // Get stream data from JS object
-StreamResponseData* get_stream_response_data(JSContext* ctx, JSValue obj) {
+StreamResponseData* get_stream_response_data(JSContext* /*ctx*/, JSValue obj) {
     return static_cast<StreamResponseData*>(JS_GetOpaque(obj, js_stream_response_class_id));
+}
+
+// Thread-local stream writer for the current context
+static thread_local quickwork::StreamWriter g_current_stream_writer;
+
+void set_stream_writer(JSContext* /*ctx*/, quickwork::StreamWriter writer) {
+    g_current_stream_writer = std::move(writer);
+}
+
+quickwork::StreamWriter get_current_stream_writer() {
+    return g_current_stream_writer;
 }
 
 // ============================================================================
@@ -841,6 +862,193 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
     return promise;
 }
 
+// Streaming fetch context
+struct StreamingFetchCtx {
+    JSContext* ctx;
+    JSValue callback;
+    std::string line_buffer;
+};
+
+size_t streaming_curl_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* sfc = static_cast<StreamingFetchCtx*>(userdata);
+    size_t total = size * nmemb;
+    
+    // Append data to line buffer
+    sfc->line_buffer.append(ptr, total);
+    
+    // Process complete lines
+    size_t pos;
+    while ((pos = sfc->line_buffer.find('\n')) != std::string::npos) {
+        std::string line = sfc->line_buffer.substr(0, pos);
+        sfc->line_buffer.erase(0, pos + 1);
+        
+        // Remove \r if present
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
+        // Call JS callback with the line
+        JSValue line_val = JS_NewString(sfc->ctx, line.c_str());
+        JSValue args[] = { line_val };
+        JSValue result = JS_Call(sfc->ctx, sfc->callback, JS_UNDEFINED, 1, args);
+        JS_FreeValue(sfc->ctx, line_val);
+        
+        if (JS_IsException(result)) {
+            JS_FreeValue(sfc->ctx, result);
+            return 0;  // Abort transfer
+        }
+        JS_FreeValue(sfc->ctx, result);
+    }
+    
+    return total;
+}
+
+// fetchStream(url, options, onChunk) - streaming fetch that calls onChunk for each line
+static JSValue js_fetch_stream(JSContext* ctx, JSValueConst /*this_val*/,
+                               int argc, JSValueConst* argv)
+{
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "fetchStream requires 3 arguments (url, options, onChunk)");
+    }
+    
+    if (!JS_IsFunction(ctx, argv[2])) {
+        return JS_ThrowTypeError(ctx, "fetchStream: third argument must be a callback function");
+    }
+    
+    // Get URL
+    const char* url_str = JS_ToCString(ctx, argv[0]);
+    if (!url_str) {
+        return JS_ThrowTypeError(ctx, "fetchStream: invalid URL");
+    }
+    std::string url(url_str);
+    JS_FreeCString(ctx, url_str);
+    
+    // Parse options
+    std::string method = "GET";
+    std::string body;
+    std::unordered_map<std::string, std::string> headers;
+    
+    if (JS_IsObject(argv[1])) {
+        JSValue options = argv[1];
+        
+        JSValue method_val = JS_GetPropertyStr(ctx, options, "method");
+        if (!JS_IsUndefined(method_val)) {
+            const char* method_str = JS_ToCString(ctx, method_val);
+            if (method_str) {
+                method = method_str;
+                JS_FreeCString(ctx, method_str);
+            }
+        }
+        JS_FreeValue(ctx, method_val);
+        
+        JSValue body_val = JS_GetPropertyStr(ctx, options, "body");
+        if (!JS_IsUndefined(body_val)) {
+            const char* body_str = JS_ToCString(ctx, body_val);
+            if (body_str) {
+                body = body_str;
+                JS_FreeCString(ctx, body_str);
+            }
+        }
+        JS_FreeValue(ctx, body_val);
+        
+        JSValue headers_val = JS_GetPropertyStr(ctx, options, "headers");
+        if (JS_IsObject(headers_val)) {
+            JSPropertyEnum* props = nullptr;
+            uint32_t prop_count = 0;
+            if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, headers_val,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+                for (uint32_t i = 0; i < prop_count; i++) {
+                    const char* key = JS_AtomToCString(ctx, props[i].atom);
+                    if (key) {
+                        JSValue val = JS_GetProperty(ctx, headers_val, props[i].atom);
+                        const char* val_str = JS_ToCString(ctx, val);
+                        if (val_str) {
+                            headers[key] = val_str;
+                            JS_FreeCString(ctx, val_str);
+                        }
+                        JS_FreeValue(ctx, val);
+                        JS_FreeCString(ctx, key);
+                    }
+                }
+                for (uint32_t i = 0; i < prop_count; i++) {
+                    JS_FreeAtom(ctx, props[i].atom);
+                }
+                js_free(ctx, props);
+            }
+        }
+        JS_FreeValue(ctx, headers_val);
+    }
+    
+    // Set up streaming context
+    StreamingFetchCtx sfc;
+    sfc.ctx = ctx;
+    sfc.callback = argv[2];
+    
+    // Perform streaming fetch
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        return JS_ThrowInternalError(ctx, "fetchStream: failed to initialize curl");
+    }
+    
+    std::unordered_map<std::string, std::string> response_headers;
+    
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streaming_curl_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sfc);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    
+    if (method == "POST") {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    }
+    
+    struct curl_slist* curl_headers = nullptr;
+    for (const auto& [key, value] : headers) {
+        std::string header_line = key + ": " + value;
+        curl_headers = curl_slist_append(curl_headers, header_line.c_str());
+    }
+    if (curl_headers) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
+    }
+    
+    CURLcode res = curl_easy_perform(curl);
+    
+    long status_code = 0;
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    }
+    
+    // Process any remaining data in buffer
+    if (!sfc.line_buffer.empty()) {
+        JSValue line_val = JS_NewString(ctx, sfc.line_buffer.c_str());
+        JSValue args[] = { line_val };
+        JSValue result = JS_Call(ctx, sfc.callback, JS_UNDEFINED, 1, args);
+        JS_FreeValue(ctx, line_val);
+        JS_FreeValue(ctx, result);
+    }
+    
+    if (curl_headers) {
+        curl_slist_free_all(curl_headers);
+    }
+    curl_easy_cleanup(curl);
+    
+    // Return status
+    JSValue result = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, result, "status", JS_NewInt32(ctx, static_cast<int>(status_code)));
+    JS_SetPropertyStr(ctx, result, "ok", JS_NewBool(ctx, status_code >= 200 && status_code < 300));
+    
+    if (res != CURLE_OK) {
+        JS_SetPropertyStr(ctx, result, "error", JS_NewString(ctx, curl_easy_strerror(res)));
+    }
+    
+    return result;
+}
+
 void setup_fetch(JSContext* ctx) {
     // Register FetchResponse class
     JS_NewClassID(&js_fetch_response_class_id);
@@ -851,10 +1059,12 @@ void setup_fetch(JSContext* ctx) {
                                sizeof(js_fetch_response_proto_funcs) / sizeof(js_fetch_response_proto_funcs[0]));
     JS_SetClassProto(ctx, js_fetch_response_class_id, proto);
     
-    // Register fetch function
+    // Register fetch functions
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "fetch",
         JS_NewCFunction(ctx, js_fetch, "fetch", 2));
+    JS_SetPropertyStr(ctx, global, "fetchStream",
+        JS_NewCFunction(ctx, js_fetch_stream, "fetchStream", 3));
     JS_FreeValue(ctx, global);
 }
 

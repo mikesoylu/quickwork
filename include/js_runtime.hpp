@@ -4,6 +4,7 @@
 #include "handler_store.hpp"
 
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,6 +17,10 @@ extern "C" {
 
 namespace quickwork {
 
+// Callback for writing streaming chunks to the client
+// Called with empty string to signal end of stream
+using StreamWriter = std::function<void(std::string_view chunk)>;
+
 struct HttpRequest {
     std::string method;
     std::string url;
@@ -27,8 +32,10 @@ struct HttpResponse {
     int status = 200;
     std::string body;
     std::unordered_map<std::string, std::string> headers;
-    bool is_streaming = false;
-    std::vector<std::string> chunks;  // For streaming responses
+    
+    // If set, response is streaming and body should be ignored
+    // The handler will write directly via this callback
+    StreamWriter stream_writer;
 };
 
 struct ExecutionStats {

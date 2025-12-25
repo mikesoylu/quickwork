@@ -1,14 +1,19 @@
 #include "server.hpp"
 #include "js_runtime.hpp"
+#include "js_bindings.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <queue>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -127,15 +132,45 @@ private:
 
         Bytecode bytecode = std::move(*bytecode_opt);
 
-        // Execute on thread pool with callback
+        // Execute on thread pool with streaming support
         auto self = shared_from_this();
+        
+        // Shared state for streaming
+        auto streaming_state = std::make_shared<StreamingState>();
+        
         thread_pool_.enqueue_with_callback(
-            [bytecode = std::move(bytecode), js_request = std::move(js_request)]
+            [self, bytecode = std::move(bytecode), js_request = std::move(js_request), streaming_state]
             (JsRuntime& runtime) -> ExecutionResult {
+                // Set up stream writer that queues chunks
+                bindings::set_stream_writer(nullptr, [self, streaming_state](std::string_view chunk) {
+                    std::lock_guard<std::mutex> lock(streaming_state->mutex);
+                    streaming_state->chunks.push(std::string(chunk));
+                    streaming_state->has_data = true;
+                    streaming_state->cv.notify_one();
+                });
+                
                 auto ctx = runtime.create_context();
-                return ctx.execute_handler(bytecode, js_request);
+                auto result = ctx.execute_handler(bytecode, js_request);
+                
+                // Signal streaming complete
+                {
+                    std::lock_guard<std::mutex> lock(streaming_state->mutex);
+                    streaming_state->complete = true;
+                    streaming_state->cv.notify_one();
+                }
+                
+                // Clear stream writer
+                bindings::set_stream_writer(nullptr, nullptr);
+                
+                return result;
             },
-            [self](ExecutionResult result) {
+            [self, streaming_state](ExecutionResult result) {
+                // Check if this was a streaming response
+                if (streaming_state->has_data) {
+                    // Streaming was handled separately
+                    return;
+                }
+                
                 if (result.response) {
                     self->send_js_response(*result.response, result.stats);
                 } else {
@@ -143,15 +178,104 @@ private:
                 }
             }
         );
+        
+        // Start streaming consumer on this thread
+        // This will send chunks as they become available
+        net::post(stream_.get_executor(), [self, streaming_state]() {
+            self->consume_stream(streaming_state);
+        });
     }
-
-    void send_js_response(const HttpResponse& js_response, const ExecutionStats& stats) {
-        // Handle streaming responses
-        if (js_response.is_streaming && !js_response.chunks.empty()) {
-            send_streaming_response(js_response, stats);
+    
+    struct StreamingState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::queue<std::string> chunks;
+        bool headers_sent = false;
+        bool complete = false;
+        bool has_data = false;
+    };
+    
+    void consume_stream(std::shared_ptr<StreamingState> state) {
+        // Wait for first chunk or completion
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait_for(lock, std::chrono::milliseconds(100), [&state] {
+            return !state->chunks.empty() || state->complete;
+        });
+        
+        // If no streaming data and complete, let the regular callback handle it
+        if (!state->has_data && state->complete) {
             return;
         }
         
+        // Send headers if not sent yet
+        if (!state->headers_sent) {
+            state->headers_sent = true;
+            lock.unlock();
+            
+            // Send chunked response headers
+            std::string headers = "HTTP/1.1 200 OK\r\n"
+                                  "Server: quickwork\r\n"
+                                  "Content-Type: text/event-stream\r\n"
+                                  "Cache-Control: no-cache\r\n"
+                                  "Connection: close\r\n"
+                                  "Transfer-Encoding: chunked\r\n"
+                                  "\r\n";
+            
+            beast::error_code ec;
+            net::write(stream_.socket(), net::buffer(headers), ec);
+            if (ec) {
+                std::cerr << "Error sending headers: " << ec.message() << "\n";
+                return;
+            }
+            
+            lock.lock();
+        }
+        
+        // Process chunks
+        while (true) {
+            // Wait for chunk or completion
+            state->cv.wait_for(lock, std::chrono::milliseconds(50), [&state] {
+                return !state->chunks.empty() || state->complete;
+            });
+            
+            // Send all available chunks
+            while (!state->chunks.empty()) {
+                std::string chunk = std::move(state->chunks.front());
+                state->chunks.pop();
+                lock.unlock();
+                
+                // Send chunk in HTTP chunked format
+                std::ostringstream oss;
+                oss << std::hex << chunk.size() << "\r\n" << chunk << "\r\n";
+                std::string chunk_data = oss.str();
+                
+                beast::error_code ec;
+                net::write(stream_.socket(), net::buffer(chunk_data), ec);
+                if (ec) {
+                    std::cerr << "Error sending chunk: " << ec.message() << "\n";
+                    return;
+                }
+                
+                lock.lock();
+            }
+            
+            // Check if complete
+            if (state->complete && state->chunks.empty()) {
+                break;
+            }
+        }
+        
+        lock.unlock();
+        
+        // Send final chunk
+        beast::error_code ec;
+        net::write(stream_.socket(), net::buffer("0\r\n\r\n"), ec);
+        
+        // Close connection
+        do_close();
+    }
+
+    void send_js_response(const HttpResponse& js_response, const ExecutionStats& stats) {
         http::response<http::string_body> res{
             static_cast<http::status>(js_response.status),
             request_.version()
@@ -179,45 +303,6 @@ private:
         res.body() = js_response.body;
         res.prepare_payload();
 
-        send_response(std::move(res));
-    }
-    
-    void send_streaming_response(const HttpResponse& js_response, const ExecutionStats& stats) {
-        // For SSE, we concatenate all chunks and send as a single response
-        // True real-time streaming would require keeping the JS context alive
-        // and yielding chunks as they're produced
-        
-        std::string body;
-        for (const auto& chunk : js_response.chunks) {
-            body += chunk;
-        }
-        
-        http::response<http::string_body> res{
-            static_cast<http::status>(js_response.status),
-            request_.version()
-        };
-        res.set(http::field::server, "quickwork");
-        res.keep_alive(false);  // Close connection after streaming
-        
-        // Add execution stats headers
-        std::ostringstream cpu_ss;
-        cpu_ss << std::fixed << std::setprecision(2) << stats.cpu_time_ms;
-        res.set("x-qw-cpu", cpu_ss.str());
-        res.set("x-qw-mem", std::to_string(stats.memory_used / 1024));
-        
-        for (const auto& [key, value] : js_response.headers) {
-            std::string lower_key = key;
-            std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
-            if (lower_key == "connection" || lower_key == "keep-alive" ||
-                lower_key == "transfer-encoding" || lower_key == "content-length") {
-                continue;
-            }
-            res.set(key, value);
-        }
-        
-        res.body() = body;
-        res.prepare_payload();
-        
         send_response(std::move(res));
     }
 

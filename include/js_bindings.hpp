@@ -1,6 +1,8 @@
 #pragma once
 
+#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -9,6 +11,7 @@ struct JSValue;
 
 namespace quickwork {
 struct HttpRequest;
+using StreamWriter = std::function<void(std::string_view chunk)>;
 }
 
 namespace quickwork::bindings {
@@ -31,10 +34,14 @@ bool has_pending_timers(JSContext* ctx);
 struct StreamResponseData {
     int status = 200;
     std::unordered_map<std::string, std::string> headers;
-    std::vector<std::string> chunks;
+    quickwork::StreamWriter writer;  // Callback to write chunks immediately
+    bool headers_sent = false;
     bool closed = false;
 };
 
 StreamResponseData* get_stream_response_data(JSContext* ctx, JSValue obj);
+
+// Set the stream writer for a context (called before executing handler)
+void set_stream_writer(JSContext* ctx, quickwork::StreamWriter writer);
 
 }  // namespace quickwork::bindings
