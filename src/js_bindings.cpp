@@ -6,7 +6,9 @@ extern "C" {
 }
 
 #include <curl/curl.h>
+#include <chrono>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <unordered_map>
 
@@ -548,6 +550,189 @@ void setup_fetch(JSContext* ctx) {
     JS_SetPropertyStr(ctx, global, "fetch",
         JS_NewCFunction(ctx, js_fetch, "fetch", 2));
     JS_FreeValue(ctx, global);
+}
+
+// ============================================================================
+// Timer API implementation (setTimeout / clearTimeout)
+// ============================================================================
+
+namespace {
+
+struct Timer {
+    int32_t id;
+    std::chrono::steady_clock::time_point fire_time;
+    JSValue callback;
+    JSValue resolve_func;  // For promise-based usage
+    bool cancelled = false;
+};
+
+// Per-context timer storage using opaque pointer on context
+struct TimerState {
+    std::map<int32_t, Timer> timers;
+    int32_t next_id = 1;
+};
+
+// Use a static map keyed by context pointer (simple approach)
+static std::unordered_map<JSContext*, TimerState> g_timer_states;
+
+TimerState& get_timer_state(JSContext* ctx) {
+    return g_timer_states[ctx];
+}
+
+}  // anonymous namespace
+
+static JSValue js_setTimeout(JSContext* ctx, JSValueConst /*this_val*/,
+                             int argc, JSValueConst* argv)
+{
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "setTimeout requires at least 1 argument");
+    }
+    
+    // First argument: callback function
+    if (!JS_IsFunction(ctx, argv[0])) {
+        return JS_ThrowTypeError(ctx, "setTimeout: first argument must be a function");
+    }
+    
+    // Second argument: delay in milliseconds (default 0)
+    int32_t delay_ms = 0;
+    if (argc >= 2) {
+        if (JS_ToInt32(ctx, &delay_ms, argv[1])) {
+            return JS_EXCEPTION;
+        }
+        if (delay_ms < 0) delay_ms = 0;
+    }
+    
+    auto& state = get_timer_state(ctx);
+    
+    Timer timer;
+    timer.id = state.next_id++;
+    timer.fire_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+    timer.callback = JS_DupValue(ctx, argv[0]);
+    timer.resolve_func = JS_UNDEFINED;
+    
+    state.timers[timer.id] = timer;
+    
+    return JS_NewInt32(ctx, timer.id);
+}
+
+static JSValue js_clearTimeout(JSContext* ctx, JSValueConst /*this_val*/,
+                               int argc, JSValueConst* argv)
+{
+    if (argc < 1) {
+        return JS_UNDEFINED;
+    }
+    
+    int32_t timer_id;
+    if (JS_ToInt32(ctx, &timer_id, argv[0])) {
+        return JS_UNDEFINED;
+    }
+    
+    auto& state = get_timer_state(ctx);
+    auto it = state.timers.find(timer_id);
+    if (it != state.timers.end()) {
+        it->second.cancelled = true;
+    }
+    
+    return JS_UNDEFINED;
+}
+
+void setup_timers(JSContext* ctx) {
+    // Initialize timer state for this context
+    g_timer_states[ctx] = TimerState{};
+    
+    JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "setTimeout",
+        JS_NewCFunction(ctx, js_setTimeout, "setTimeout", 2));
+    JS_SetPropertyStr(ctx, global, "clearTimeout",
+        JS_NewCFunction(ctx, js_clearTimeout, "clearTimeout", 1));
+    JS_FreeValue(ctx, global);
+}
+
+bool process_timers(JSContext* ctx) {
+    auto it = g_timer_states.find(ctx);
+    if (it == g_timer_states.end()) {
+        return false;
+    }
+    
+    auto& state = it->second;
+    auto now = std::chrono::steady_clock::now();
+    bool processed_any = false;
+    
+    // Collect expired timers
+    std::vector<int32_t> expired_ids;
+    for (auto& [id, timer] : state.timers) {
+        if (!timer.cancelled && now >= timer.fire_time) {
+            expired_ids.push_back(id);
+        }
+    }
+    
+    // Fire expired timers
+    for (int32_t id : expired_ids) {
+        auto timer_it = state.timers.find(id);
+        if (timer_it == state.timers.end()) continue;
+        
+        Timer& timer = timer_it->second;
+        if (timer.cancelled) {
+            JS_FreeValue(ctx, timer.callback);
+            if (!JS_IsUndefined(timer.resolve_func)) {
+                JS_FreeValue(ctx, timer.resolve_func);
+            }
+            state.timers.erase(timer_it);
+            continue;
+        }
+        
+        // Call the callback
+        JSValue ret = JS_Call(ctx, timer.callback, JS_UNDEFINED, 0, nullptr);
+        if (JS_IsException(ret)) {
+            // Log but don't propagate - timer callbacks shouldn't break the main flow
+            JSValue exc = JS_GetException(ctx);
+            const char* str = JS_ToCString(ctx, exc);
+            if (str) {
+                std::cerr << "Timer callback error: " << str << "\n";
+                JS_FreeCString(ctx, str);
+            }
+            JS_FreeValue(ctx, exc);
+        }
+        JS_FreeValue(ctx, ret);
+        
+        // Cleanup
+        JS_FreeValue(ctx, timer.callback);
+        if (!JS_IsUndefined(timer.resolve_func)) {
+            JS_FreeValue(ctx, timer.resolve_func);
+        }
+        state.timers.erase(timer_it);
+        processed_any = true;
+    }
+    
+    return processed_any;
+}
+
+bool has_pending_timers(JSContext* ctx) {
+    auto it = g_timer_states.find(ctx);
+    if (it == g_timer_states.end()) {
+        return false;
+    }
+    
+    for (const auto& [id, timer] : it->second.timers) {
+        if (!timer.cancelled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Cleanup timer state when context is destroyed (called from JsContext destructor)
+void cleanup_timers(JSContext* ctx) {
+    auto it = g_timer_states.find(ctx);
+    if (it != g_timer_states.end()) {
+        for (auto& [id, timer] : it->second.timers) {
+            JS_FreeValue(ctx, timer.callback);
+            if (!JS_IsUndefined(timer.resolve_func)) {
+                JS_FreeValue(ctx, timer.resolve_func);
+            }
+        }
+        g_timer_states.erase(it);
+    }
 }
 
 }  // namespace quickwork::bindings

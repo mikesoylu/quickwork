@@ -5,6 +5,7 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace quickwork {
 
@@ -59,6 +60,7 @@ JsContext::JsContext(JSRuntime* rt, const Config& config) : config_(config) {
 
 JsContext::~JsContext() {
     if (ctx_) {
+        bindings::cleanup_timers(ctx_);
         JS_FreeContext(ctx_);
     }
 }
@@ -92,6 +94,7 @@ void JsContext::setup_bindings() {
     bindings::setup_request_class(ctx_);
     bindings::setup_response_class(ctx_);
     bindings::setup_fetch(ctx_);
+    bindings::setup_timers(ctx_);
 }
 
 void JsContext::handle_exception() {
@@ -219,13 +222,24 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
     int ret;
 
     while (true) {
+        // Execute pending JS jobs (microtasks)
         ret = JS_ExecutePendingJob(JS_GetRuntime(ctx_), &ctx_ptr);
         if (ret < 0) {
             handle_exception();
             return std::nullopt;
         }
-        if (ret == 0) {
-            break;
+        
+        // Process any expired timers
+        bool timer_fired = bindings::process_timers(ctx_);
+        
+        // If no jobs and no timers fired, check if we should continue waiting
+        if (ret == 0 && !timer_fired) {
+            // Check if there are pending timers we need to wait for
+            if (!bindings::has_pending_timers(ctx_)) {
+                break;
+            }
+            // Small sleep to avoid busy-waiting
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
 
         // Check timeout

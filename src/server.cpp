@@ -125,7 +125,7 @@ private:
             },
             [self](ExecutionResult result) {
                 if (result.response) {
-                    self->send_js_response(*result.response);
+                    self->send_js_response(*result.response, result.stats);
                 } else {
                     self->send_error(500, result.error.empty() ? "Handler execution failed" : result.error);
                 }
@@ -133,13 +133,19 @@ private:
         );
     }
 
-    void send_js_response(const HttpResponse& js_response) {
+    void send_js_response(const HttpResponse& js_response, const ExecutionStats& stats) {
         http::response<http::string_body> res{
             static_cast<http::status>(js_response.status),
             request_.version()
         };
         res.set(http::field::server, "quickwork");
         res.keep_alive(request_.keep_alive());
+
+        // Add execution stats headers
+        std::ostringstream cpu_ss;
+        cpu_ss << std::fixed << std::setprecision(2) << stats.cpu_time_ms;
+        res.set("x-qw-cpu", cpu_ss.str());
+        res.set("x-qw-mem", std::to_string(stats.memory_used / 1024));
 
         for (const auto& [key, value] : js_response.headers) {
             // Skip hop-by-hop headers that shouldn't be forwarded
