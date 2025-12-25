@@ -8,12 +8,58 @@
 #include <stdexcept>
 #include <thread>
 
+#include <sys/resource.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_info.h>
+#endif
+
 namespace quickwork {
 
 namespace {
 
 thread_local std::chrono::steady_clock::time_point g_start_time;
 thread_local uint32_t g_max_cpu_time_ms = 5000;
+thread_local double g_start_cpu_time_ms = 0.0;
+
+// Get current thread CPU time (user + system) in milliseconds
+double get_thread_cpu_time_ms() {
+#if defined(__APPLE__)
+    // macOS: use thread_info for per-thread CPU time
+    mach_port_t thread_port = mach_thread_self();
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info(thread_port, THREAD_BASIC_INFO, 
+                                   reinterpret_cast<thread_info_t>(&info), &count);
+    mach_port_deallocate(mach_task_self(), thread_port);
+    
+    if (kr == KERN_SUCCESS) {
+        double user_ms = info.user_time.seconds * 1000.0 + info.user_time.microseconds / 1000.0;
+        double sys_ms = info.system_time.seconds * 1000.0 + info.system_time.microseconds / 1000.0;
+        return user_ms + sys_ms;
+    }
+    return 0.0;
+#elif defined(__linux__)
+    // Linux: use RUSAGE_THREAD
+    struct rusage usage;
+    if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+        double user_ms = usage.ru_utime.tv_sec * 1000.0 + usage.ru_utime.tv_usec / 1000.0;
+        double sys_ms = usage.ru_stime.tv_sec * 1000.0 + usage.ru_stime.tv_usec / 1000.0;
+        return user_ms + sys_ms;
+    }
+    return 0.0;
+#else
+    // Fallback: use process-wide CPU time (less accurate)
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        double user_ms = usage.ru_utime.tv_sec * 1000.0 + usage.ru_utime.tv_usec / 1000.0;
+        double sys_ms = usage.ru_stime.tv_sec * 1000.0 + usage.ru_stime.tv_usec / 1000.0;
+        return user_ms + sys_ms;
+    }
+    return 0.0;
+#endif
+}
 
 int interrupt_handler(JSRuntime* /*rt*/, void* /*opaque*/) {
     auto now = std::chrono::steady_clock::now();
@@ -54,6 +100,7 @@ JsContext::JsContext(JSRuntime* rt, const Config& config) : config_(config) {
 
     start_time_ = std::chrono::steady_clock::now();
     g_start_time = start_time_;
+    g_start_cpu_time_ms = get_thread_cpu_time_ms();
     g_max_cpu_time_ms = config_.max_cpu_time_ms;
 
     setup_bindings();
@@ -336,9 +383,9 @@ ExecutionResult JsContext::execute_handler(
 
     exec_result.response = extract_response(result);
     
-    // Collect stats
-    auto end_time = std::chrono::steady_clock::now();
-    exec_result.stats.cpu_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time_).count();
+    // Collect stats - use actual CPU time, not wall-clock time
+    double end_cpu_time_ms = get_thread_cpu_time_ms();
+    exec_result.stats.cpu_time_ms = end_cpu_time_ms - g_start_cpu_time_ms;
     
     JSMemoryUsage mem_usage;
     JS_ComputeMemoryUsage(JS_GetRuntime(ctx_), &mem_usage);
