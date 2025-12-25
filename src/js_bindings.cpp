@@ -562,21 +562,42 @@ struct Timer {
     int32_t id;
     std::chrono::steady_clock::time_point fire_time;
     JSValue callback;
-    JSValue resolve_func;  // For promise-based usage
     bool cancelled = false;
 };
 
-// Per-context timer storage using opaque pointer on context
+// Per-context timer storage - stored as opaque data on a global object
 struct TimerState {
     std::map<int32_t, Timer> timers;
     int32_t next_id = 1;
 };
 
-// Use a static map keyed by context pointer (simple approach)
-static std::unordered_map<JSContext*, TimerState> g_timer_states;
+static JSClassID js_timer_state_class_id;
 
-TimerState& get_timer_state(JSContext* ctx) {
-    return g_timer_states[ctx];
+static void js_timer_state_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* state = static_cast<TimerState*>(JS_GetOpaque(val, js_timer_state_class_id));
+    // Note: Timer callbacks should already be freed by cleanup_timers
+    delete state;
+}
+
+static JSClassDef js_timer_state_class = {
+    "TimerState",
+    .finalizer = js_timer_state_finalizer,
+};
+
+static bool timer_class_registered = false;
+
+TimerState* get_timer_state(JSContext* ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue state_val = JS_GetPropertyStr(ctx, global, "__timer_state__");
+    JS_FreeValue(ctx, global);
+    
+    if (JS_IsUndefined(state_val)) {
+        return nullptr;
+    }
+    
+    auto* state = static_cast<TimerState*>(JS_GetOpaque(state_val, js_timer_state_class_id));
+    JS_FreeValue(ctx, state_val);
+    return state;
 }
 
 }  // anonymous namespace
@@ -602,15 +623,17 @@ static JSValue js_setTimeout(JSContext* ctx, JSValueConst /*this_val*/,
         if (delay_ms < 0) delay_ms = 0;
     }
     
-    auto& state = get_timer_state(ctx);
+    auto* state = get_timer_state(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "Timer state not initialized");
+    }
     
     Timer timer;
-    timer.id = state.next_id++;
+    timer.id = state->next_id++;
     timer.fire_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
     timer.callback = JS_DupValue(ctx, argv[0]);
-    timer.resolve_func = JS_UNDEFINED;
     
-    state.timers[timer.id] = timer;
+    state->timers[timer.id] = timer;
     
     return JS_NewInt32(ctx, timer.id);
 }
@@ -627,9 +650,12 @@ static JSValue js_clearTimeout(JSContext* ctx, JSValueConst /*this_val*/,
         return JS_UNDEFINED;
     }
     
-    auto& state = get_timer_state(ctx);
-    auto it = state.timers.find(timer_id);
-    if (it != state.timers.end()) {
+    auto* state = get_timer_state(ctx);
+    if (!state) {
+        return JS_UNDEFINED;
+    }
+    auto it = state->timers.find(timer_id);
+    if (it != state->timers.end()) {
         it->second.cancelled = true;
     }
     
@@ -637,10 +663,20 @@ static JSValue js_clearTimeout(JSContext* ctx, JSValueConst /*this_val*/,
 }
 
 void setup_timers(JSContext* ctx) {
-    // Initialize timer state for this context
-    g_timer_states[ctx] = TimerState{};
+    // Register the timer state class (once per runtime)
+    if (!timer_class_registered) {
+        JS_NewClassID(&js_timer_state_class_id);
+        timer_class_registered = true;
+    }
+    JS_NewClass(JS_GetRuntime(ctx), js_timer_state_class_id, &js_timer_state_class);
+    
+    // Create and store timer state on global object
+    JSValue state_obj = JS_NewObjectClass(ctx, static_cast<int>(js_timer_state_class_id));
+    auto* state = new TimerState{};
+    JS_SetOpaque(state_obj, state);
     
     JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "__timer_state__", state_obj);
     JS_SetPropertyStr(ctx, global, "setTimeout",
         JS_NewCFunction(ctx, js_setTimeout, "setTimeout", 2));
     JS_SetPropertyStr(ctx, global, "clearTimeout",
@@ -649,18 +685,17 @@ void setup_timers(JSContext* ctx) {
 }
 
 bool process_timers(JSContext* ctx) {
-    auto it = g_timer_states.find(ctx);
-    if (it == g_timer_states.end()) {
+    auto* state = get_timer_state(ctx);
+    if (!state) {
         return false;
     }
     
-    auto& state = it->second;
     auto now = std::chrono::steady_clock::now();
     bool processed_any = false;
     
     // Collect expired timers
     std::vector<int32_t> expired_ids;
-    for (auto& [id, timer] : state.timers) {
+    for (auto& [id, timer] : state->timers) {
         if (!timer.cancelled && now >= timer.fire_time) {
             expired_ids.push_back(id);
         }
@@ -668,16 +703,13 @@ bool process_timers(JSContext* ctx) {
     
     // Fire expired timers
     for (int32_t id : expired_ids) {
-        auto timer_it = state.timers.find(id);
-        if (timer_it == state.timers.end()) continue;
+        auto timer_it = state->timers.find(id);
+        if (timer_it == state->timers.end()) continue;
         
         Timer& timer = timer_it->second;
         if (timer.cancelled) {
             JS_FreeValue(ctx, timer.callback);
-            if (!JS_IsUndefined(timer.resolve_func)) {
-                JS_FreeValue(ctx, timer.resolve_func);
-            }
-            state.timers.erase(timer_it);
+            state->timers.erase(timer_it);
             continue;
         }
         
@@ -697,10 +729,7 @@ bool process_timers(JSContext* ctx) {
         
         // Cleanup
         JS_FreeValue(ctx, timer.callback);
-        if (!JS_IsUndefined(timer.resolve_func)) {
-            JS_FreeValue(ctx, timer.resolve_func);
-        }
-        state.timers.erase(timer_it);
+        state->timers.erase(timer_it);
         processed_any = true;
     }
     
@@ -708,12 +737,12 @@ bool process_timers(JSContext* ctx) {
 }
 
 bool has_pending_timers(JSContext* ctx) {
-    auto it = g_timer_states.find(ctx);
-    if (it == g_timer_states.end()) {
+    auto* state = get_timer_state(ctx);
+    if (!state) {
         return false;
     }
     
-    for (const auto& [id, timer] : it->second.timers) {
+    for (const auto& [id, timer] : state->timers) {
         if (!timer.cancelled) {
             return true;
         }
@@ -723,16 +752,15 @@ bool has_pending_timers(JSContext* ctx) {
 
 // Cleanup timer state when context is destroyed (called from JsContext destructor)
 void cleanup_timers(JSContext* ctx) {
-    auto it = g_timer_states.find(ctx);
-    if (it != g_timer_states.end()) {
-        for (auto& [id, timer] : it->second.timers) {
+    auto* state = get_timer_state(ctx);
+    if (state) {
+        for (auto& [id, timer] : state->timers) {
             JS_FreeValue(ctx, timer.callback);
-            if (!JS_IsUndefined(timer.resolve_func)) {
-                JS_FreeValue(ctx, timer.resolve_func);
-            }
         }
-        g_timer_states.erase(it);
+        state->timers.clear();
     }
+    // Note: The TimerState itself will be freed by js_timer_state_finalizer
+    // when the context is freed
 }
 
 }  // namespace quickwork::bindings
