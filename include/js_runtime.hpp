@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 extern "C" {
 #include "quickjs.h"
@@ -26,6 +27,8 @@ struct HttpResponse {
     int status = 200;
     std::string body;
     std::unordered_map<std::string, std::string> headers;
+    bool is_streaming = false;
+    std::vector<std::string> chunks;  // For streaming responses
 };
 
 struct ExecutionStats {

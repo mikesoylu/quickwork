@@ -127,6 +127,70 @@ export default async function(req) {
 }
 ```
 
+### Server-Sent Events (SSE)
+
+Use `StreamResponse` to create SSE responses:
+
+```javascript
+export default function(req) {
+  const stream = new StreamResponse();
+  
+  // Send events with optional id and event type
+  stream.send({ data: { message: "Hello" }, id: "1" });
+  stream.send({ data: { message: "World" }, id: "2", event: "update" });
+  stream.send({ data: "[DONE]" });
+  
+  return stream;
+}
+```
+
+Output:
+```
+id: 1
+data: {"message":"Hello"}
+
+id: 2
+event: update
+data: {"message":"World"}
+
+data: [DONE]
+```
+
+The `StreamResponse` constructor accepts an options object:
+
+```javascript
+const stream = new StreamResponse({
+  status: 200,
+  headers: {
+    "X-Custom-Header": "value"
+  }
+});
+```
+
+Methods:
+- `send(data)` - Send an SSE event. If data is an object with `data`, `id`, or `event` properties, they are formatted accordingly. Objects are automatically JSON stringified.
+- `write(chunk)` - Write raw data to the stream
+- `close()` - Mark the stream as complete
+
+Example: AI-style token streaming:
+
+```javascript
+export default async function(req) {
+  const stream = new StreamResponse();
+  
+  const tokens = ["Hello", " ", "world", "!"];
+  for (let i = 0; i < tokens.length; i++) {
+    stream.send({ 
+      data: { delta: tokens[i], index: i },
+      id: String(i)
+    });
+  }
+  
+  stream.send({ data: "[DONE]" });
+  return stream;
+}
+```
+
 ### Crypto API
 
 Web Crypto API for generating random values and UUIDs:

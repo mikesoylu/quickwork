@@ -146,6 +146,12 @@ private:
     }
 
     void send_js_response(const HttpResponse& js_response, const ExecutionStats& stats) {
+        // Handle streaming responses
+        if (js_response.is_streaming && !js_response.chunks.empty()) {
+            send_streaming_response(js_response, stats);
+            return;
+        }
+        
         http::response<http::string_body> res{
             static_cast<http::status>(js_response.status),
             request_.version()
@@ -173,6 +179,45 @@ private:
         res.body() = js_response.body;
         res.prepare_payload();
 
+        send_response(std::move(res));
+    }
+    
+    void send_streaming_response(const HttpResponse& js_response, const ExecutionStats& stats) {
+        // For SSE, we concatenate all chunks and send as a single response
+        // True real-time streaming would require keeping the JS context alive
+        // and yielding chunks as they're produced
+        
+        std::string body;
+        for (const auto& chunk : js_response.chunks) {
+            body += chunk;
+        }
+        
+        http::response<http::string_body> res{
+            static_cast<http::status>(js_response.status),
+            request_.version()
+        };
+        res.set(http::field::server, "quickwork");
+        res.keep_alive(false);  // Close connection after streaming
+        
+        // Add execution stats headers
+        std::ostringstream cpu_ss;
+        cpu_ss << std::fixed << std::setprecision(2) << stats.cpu_time_ms;
+        res.set("x-qw-cpu", cpu_ss.str());
+        res.set("x-qw-mem", std::to_string(stats.memory_used / 1024));
+        
+        for (const auto& [key, value] : js_response.headers) {
+            std::string lower_key = key;
+            std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+            if (lower_key == "connection" || lower_key == "keep-alive" ||
+                lower_key == "transfer-encoding" || lower_key == "content-length") {
+                continue;
+            }
+            res.set(key, value);
+        }
+        
+        res.body() = body;
+        res.prepare_payload();
+        
         send_response(std::move(res));
     }
 

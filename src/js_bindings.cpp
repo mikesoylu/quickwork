@@ -322,6 +322,226 @@ void setup_response_class(JSContext* ctx) {
 }
 
 // ============================================================================
+// StreamResponse for SSE streaming
+// ============================================================================
+
+static JSClassID js_stream_response_class_id;
+
+// StreamResponseData is defined in js_bindings.hpp
+
+static void js_stream_response_finalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* data = static_cast<StreamResponseData*>(JS_GetOpaque(val, js_stream_response_class_id));
+    delete data;
+}
+
+static JSClassDef js_stream_response_class = {
+    .class_name = "StreamResponse",
+    .finalizer = js_stream_response_finalizer,
+};
+
+static JSValue js_stream_response_write(JSContext* ctx, JSValueConst this_val,
+                                        int argc, JSValueConst* argv) {
+    auto* data = static_cast<StreamResponseData*>(JS_GetOpaque(this_val, js_stream_response_class_id));
+    if (!data) return JS_EXCEPTION;
+    
+    if (data->closed) {
+        return JS_ThrowTypeError(ctx, "StreamResponse is already closed");
+    }
+    
+    if (argc >= 1) {
+        const char* chunk = JS_ToCString(ctx, argv[0]);
+        if (chunk) {
+            data->chunks.push_back(chunk);
+            JS_FreeCString(ctx, chunk);
+        }
+    }
+    
+    return JS_DupValue(ctx, this_val);  // Return this for chaining
+}
+
+static JSValue js_stream_response_close(JSContext* ctx, JSValueConst this_val,
+                                        int /*argc*/, JSValueConst* /*argv*/) {
+    auto* data = static_cast<StreamResponseData*>(JS_GetOpaque(this_val, js_stream_response_class_id));
+    if (!data) return JS_EXCEPTION;
+    
+    data->closed = true;
+    return JS_DupValue(ctx, this_val);
+}
+
+static JSValue js_stream_response_constructor(JSContext* ctx, JSValueConst /*new_target*/,
+                                              int argc, JSValueConst* argv) {
+    JSValue obj = JS_NewObjectClass(ctx, js_stream_response_class_id);
+    if (JS_IsException(obj)) return obj;
+    
+    auto* data = new StreamResponseData();
+    
+    // Default SSE headers
+    data->headers["Content-Type"] = "text/event-stream";
+    data->headers["Cache-Control"] = "no-cache";
+    data->headers["Connection"] = "keep-alive";
+    
+    if (argc >= 1 && JS_IsObject(argv[0])) {
+        // Options object
+        JSValue status_val = JS_GetPropertyStr(ctx, argv[0], "status");
+        if (JS_IsNumber(status_val)) {
+            int32_t status;
+            JS_ToInt32(ctx, &status, status_val);
+            data->status = status;
+        }
+        JS_FreeValue(ctx, status_val);
+        
+        JSValue headers_val = JS_GetPropertyStr(ctx, argv[0], "headers");
+        if (JS_IsObject(headers_val)) {
+            JSPropertyEnum* props = nullptr;
+            uint32_t prop_count = 0;
+            if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, headers_val,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+                for (uint32_t i = 0; i < prop_count; i++) {
+                    const char* key = JS_AtomToCString(ctx, props[i].atom);
+                    if (key) {
+                        JSValue val = JS_GetProperty(ctx, headers_val, props[i].atom);
+                        const char* val_str = JS_ToCString(ctx, val);
+                        if (val_str) {
+                            data->headers[key] = val_str;
+                            JS_FreeCString(ctx, val_str);
+                        }
+                        JS_FreeValue(ctx, val);
+                        JS_FreeCString(ctx, key);
+                    }
+                }
+                for (uint32_t i = 0; i < prop_count; i++) {
+                    JS_FreeAtom(ctx, props[i].atom);
+                }
+                js_free(ctx, props);
+            }
+        }
+        JS_FreeValue(ctx, headers_val);
+    }
+    
+    JS_SetOpaque(obj, data);
+    
+    // Mark as streaming response
+    JS_SetPropertyStr(ctx, obj, "__streaming__", JS_TRUE);
+    JS_SetPropertyStr(ctx, obj, "status", JS_NewInt32(ctx, data->status));
+    
+    return obj;
+}
+
+// Helper to send SSE event
+static JSValue js_stream_response_send_event(JSContext* ctx, JSValueConst this_val,
+                                             int argc, JSValueConst* argv) {
+    auto* data = static_cast<StreamResponseData*>(JS_GetOpaque(this_val, js_stream_response_class_id));
+    if (!data) return JS_EXCEPTION;
+    
+    if (data->closed) {
+        return JS_ThrowTypeError(ctx, "StreamResponse is already closed");
+    }
+    
+    std::string event;
+    
+    // Check if first arg is an object with data/event/id fields
+    if (argc >= 1 && JS_IsObject(argv[0])) {
+        JSValue event_type = JS_GetPropertyStr(ctx, argv[0], "event");
+        if (!JS_IsUndefined(event_type)) {
+            const char* et = JS_ToCString(ctx, event_type);
+            if (et) {
+                event += "event: ";
+                event += et;
+                event += "\n";
+                JS_FreeCString(ctx, et);
+            }
+        }
+        JS_FreeValue(ctx, event_type);
+        
+        JSValue id_val = JS_GetPropertyStr(ctx, argv[0], "id");
+        if (!JS_IsUndefined(id_val)) {
+            const char* id = JS_ToCString(ctx, id_val);
+            if (id) {
+                event += "id: ";
+                event += id;
+                event += "\n";
+                JS_FreeCString(ctx, id);
+            }
+        }
+        JS_FreeValue(ctx, id_val);
+        
+        JSValue data_val = JS_GetPropertyStr(ctx, argv[0], "data");
+        if (!JS_IsUndefined(data_val)) {
+            // If data is an object, JSON stringify it
+            if (JS_IsObject(data_val) && !JS_IsNull(data_val)) {
+                JSValue json = JS_JSONStringify(ctx, data_val, JS_UNDEFINED, JS_UNDEFINED);
+                if (!JS_IsException(json)) {
+                    const char* json_str = JS_ToCString(ctx, json);
+                    if (json_str) {
+                        event += "data: ";
+                        event += json_str;
+                        event += "\n";
+                        JS_FreeCString(ctx, json_str);
+                    }
+                }
+                JS_FreeValue(ctx, json);
+            } else {
+                const char* d = JS_ToCString(ctx, data_val);
+                if (d) {
+                    event += "data: ";
+                    event += d;
+                    event += "\n";
+                    JS_FreeCString(ctx, d);
+                }
+            }
+        }
+        JS_FreeValue(ctx, data_val);
+    } else if (argc >= 1) {
+        // Simple string data
+        const char* d = JS_ToCString(ctx, argv[0]);
+        if (d) {
+            event += "data: ";
+            event += d;
+            event += "\n";
+            JS_FreeCString(ctx, d);
+        }
+    }
+    
+    event += "\n";  // End of event
+    data->chunks.push_back(event);
+    
+    return JS_DupValue(ctx, this_val);
+}
+
+void setup_stream_response_class(JSContext* ctx) {
+    JS_NewClassID(&js_stream_response_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), js_stream_response_class_id, &js_stream_response_class);
+    
+    JSValue global = JS_GetGlobalObject(ctx);
+    
+    // StreamResponse prototype
+    JSValue proto = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, proto, "write", 
+        JS_NewCFunction(ctx, js_stream_response_write, "write", 1));
+    JS_SetPropertyStr(ctx, proto, "close",
+        JS_NewCFunction(ctx, js_stream_response_close, "close", 0));
+    JS_SetPropertyStr(ctx, proto, "send",
+        JS_NewCFunction(ctx, js_stream_response_send_event, "send", 1));
+    JS_SetPropertyStr(ctx, proto, "enqueue",
+        JS_NewCFunction(ctx, js_stream_response_send_event, "enqueue", 1));
+    
+    JS_SetClassProto(ctx, js_stream_response_class_id, proto);
+    
+    // StreamResponse constructor
+    JSValue stream_response_ctor = JS_NewCFunction2(ctx, js_stream_response_constructor, 
+                                                     "StreamResponse", 1,
+                                                     JS_CFUNC_constructor, 0);
+    
+    JS_SetPropertyStr(ctx, global, "StreamResponse", stream_response_ctor);
+    JS_FreeValue(ctx, global);
+}
+
+// Get stream data from JS object
+StreamResponseData* get_stream_response_data(JSContext* ctx, JSValue obj) {
+    return static_cast<StreamResponseData*>(JS_GetOpaque(obj, js_stream_response_class_id));
+}
+
+// ============================================================================
 // Fetch API implementation using libcurl
 // ============================================================================
 

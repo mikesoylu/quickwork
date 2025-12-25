@@ -146,6 +146,7 @@ void JsContext::setup_bindings() {
     bindings::setup_crypto(ctx_);
     bindings::setup_request_class(ctx_);
     bindings::setup_response_class(ctx_);
+    bindings::setup_stream_response_class(ctx_);
     bindings::setup_fetch(ctx_);
     bindings::setup_timers(ctx_);
 }
@@ -209,6 +210,24 @@ std::optional<HttpResponse> JsContext::extract_response(JSValue val) {
             auto result = await_promise(val);
             JS_FreeValue(ctx_, val);
             return result;
+        }
+    }
+
+    // Check if it's a StreamResponse
+    JSValue streaming_val = JS_GetPropertyStr(ctx_, val, "__streaming__");
+    bool is_streaming = JS_ToBool(ctx_, streaming_val);
+    JS_FreeValue(ctx_, streaming_val);
+    
+    if (is_streaming) {
+        auto* stream_data = bindings::get_stream_response_data(ctx_, val);
+        if (stream_data) {
+            HttpResponse response;
+            response.status = stream_data->status;
+            response.headers = stream_data->headers;
+            response.is_streaming = true;
+            response.chunks = stream_data->chunks;
+            JS_FreeValue(ctx_, val);
+            return response;
         }
     }
 
