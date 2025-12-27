@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 
@@ -194,17 +195,29 @@ Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view sou
     // Transform "export default" to a form QuickJS can handle
     std::string transformed = bundled_source;
     
-    size_t pos = transformed.find("export default function");
-    if (pos != std::string::npos) {
-        transformed.replace(pos, 23, "__handler__ = function");
+    // Handle esbuild's "export { name as default }" syntax
+    // Pattern: export {\n  name as default\n};
+    std::regex export_as_default_regex(R"(export\s*\{\s*(\w+)\s+as\s+default\s*\}\s*;?)");
+    std::smatch match;
+    if (std::regex_search(transformed, match, export_as_default_regex)) {
+        std::string handler_name = match[1].str();
+        // Remove the export statement and add assignment at the end
+        transformed = std::regex_replace(transformed, export_as_default_regex, "");
+        transformed += "\n__handler__ = " + handler_name + ";\n";
     } else {
-        pos = transformed.find("export default async function");
+        // Traditional export default handling
+        size_t pos = transformed.find("export default function");
         if (pos != std::string::npos) {
-            transformed.replace(pos, 29, "__handler__ = async function");
+            transformed.replace(pos, 23, "__handler__ = function");
         } else {
-            pos = transformed.find("export default");
+            pos = transformed.find("export default async function");
             if (pos != std::string::npos) {
-                transformed.replace(pos, 14, "__handler__ =");
+                transformed.replace(pos, 29, "__handler__ = async function");
+            } else {
+                pos = transformed.find("export default");
+                if (pos != std::string::npos) {
+                    transformed.replace(pos, 14, "__handler__ =");
+                }
             }
         }
     }

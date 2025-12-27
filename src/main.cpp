@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 
 #include <csignal>
+#include <fstream>
 #include <iostream>
 #include <memory>
 
@@ -21,14 +22,65 @@ void signal_handler(int /*signum*/) {
     }
     std::exit(0);
 }
+
+// Add .qw to .gitignore if it exists and doesn't already contain .qw
+void ensure_gitignore_entry() {
+    std::filesystem::path gitignore_path = ".gitignore";
+    
+    if (!std::filesystem::exists(gitignore_path)) {
+        return;  // No .gitignore, nothing to do
+    }
+    
+    // Read existing content
+    std::ifstream in(gitignore_path);
+    if (!in) {
+        return;
+    }
+    
+    std::string content;
+    std::string line;
+    bool has_qw_entry = false;
+    
+    while (std::getline(in, line)) {
+        content += line + "\n";
+        // Check if .qw is already in gitignore (with or without trailing slash)
+        if (line == ".qw" || line == ".qw/" || line == "/.qw" || line == "/.qw/") {
+            has_qw_entry = true;
+        }
+    }
+    in.close();
+    
+    if (has_qw_entry) {
+        return;  // Already present
+    }
+    
+    // Append .qw to gitignore
+    std::ofstream out(gitignore_path, std::ios::app);
+    if (!out) {
+        std::cerr << "Warning: Could not update .gitignore\n";
+        return;
+    }
+    
+    // Add newline if file doesn't end with one
+    if (!content.empty() && content.back() != '\n') {
+        out << "\n";
+    }
+    out << ".qw/\n";
+    out.close();
+    
+    std::cout << "Added .qw/ to .gitignore\n";
+}
 }  // namespace
 
 int main(int argc, char* argv[]) {
     quickwork::Config config;
+    std::string dev_file;
 
     po::options_description desc("QuickWork - Multithreaded QuickJS Web Server");
     desc.add_options()
         ("help,h", "Show help message")
+        ("dev,d", po::value<std::string>(&dev_file),
+            "Dev mode: watch handler file and auto-reload on changes")
         ("host,H", po::value<std::string>(&config.host)->default_value("0.0.0.0"),
             "Host to bind to")
         ("port,p", po::value<uint16_t>(&config.port)->default_value(8080),
@@ -64,6 +116,8 @@ int main(int argc, char* argv[]) {
         std::cout << "\nUsage:\n";
         std::cout << "  # Start the server\n";
         std::cout << "  ./quickwork -p 8080\n\n";
+        std::cout << "  # Dev mode with auto-reload\n";
+        std::cout << "  ./quickwork --dev handler.js\n\n";
         std::cout << "  # Register a handler (POST without x-handler-id)\n";
         std::cout << R"(  curl -X POST http://localhost:8080 -d 'export default (req) => new Response("Hello!")')" << "\n\n";
         std::cout << "  # Execute a handler (any method with x-handler-id)\n";
@@ -71,7 +125,23 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (vm.count("cache-dir")) {
+    // Handle dev mode
+    if (vm.count("dev")) {
+        config.dev_mode = true;
+        config.dev_handler_file = dev_file;
+        config.cache_dir = "./.qw/handlers";
+        
+        // Verify handler file exists
+        if (!std::filesystem::exists(config.dev_handler_file)) {
+            std::cerr << "Error: Handler file not found: " << config.dev_handler_file << "\n";
+            return 1;
+        }
+        
+        // Add .qw to .gitignore if applicable
+        ensure_gitignore_entry();
+    }
+
+    if (vm.count("cache-dir") && !config.dev_mode) {
         config.cache_dir = vm["cache-dir"].as<std::string>();
     }
 
@@ -87,6 +157,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "QuickWork v1.0.0\n";
     std::cout << "===============\n";
+    if (config.dev_mode) {
+        std::cout << "Mode: DEV (auto-reload enabled)\n";
+        std::cout << "Handler: " << config.dev_handler_file << "\n";
+    }
     std::cout << "Cache directory: " << config.cache_dir << "\n";
     std::cout << "Handler cache: " << config.handler_cache_size << " entries\n";
     std::cout << "Max storage: " << (config.max_cache_storage_mb == 0 ? "unlimited" : std::to_string(config.max_cache_storage_mb) + " MB") << "\n";

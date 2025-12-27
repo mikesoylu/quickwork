@@ -8,12 +8,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <sstream>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -78,11 +83,23 @@ private:
         auto handler_id_it = request_.find("x-handler-id");
 
         if (request_.method() == http::verb::post && handler_id_it == request_.end()) {
-            // Handler loader endpoint
+            // Handler loader endpoint (disabled in dev mode)
+            if (server_.is_dev_mode()) {
+                send_error(400, "Handler registration disabled in dev mode");
+                return;
+            }
             handle_loader();
         } else if (handler_id_it != request_.end()) {
-            // Execute handler
+            // Execute handler by ID
             handle_execute(std::string(handler_id_it->value()));
+        } else if (server_.is_dev_mode()) {
+            // Dev mode: use the dev handler for all requests without x-handler-id
+            std::string dev_id = server_.get_dev_handler_id();
+            if (dev_id.empty()) {
+                send_error(500, "Dev handler not loaded");
+                return;
+            }
+            handle_execute(dev_id);
         } else {
             // No handler specified
             send_error(400, "Missing x-handler-id header");
@@ -433,6 +450,10 @@ Server::Server(const Config& config)
     , handler_store_(std::make_unique<HandlerStore>(config_))
     , thread_pool_(std::make_unique<ThreadPool>(config_))
 {
+    // In dev mode, load the handler immediately
+    if (config_.dev_mode) {
+        reload_dev_handler();
+    }
 }
 
 Server::~Server() {
@@ -444,8 +465,177 @@ std::string Server::store_handler(std::string_view source) {
     return handler_store_->store(compiler_runtime_->get(), source);
 }
 
+std::string Server::get_dev_handler_id() const {
+    std::shared_lock lock(dev_handler_mutex_);
+    return dev_handler_id_;
+}
+
+namespace {
+// Check if file needs TypeScript/JSX compilation
+bool needs_compilation(const std::filesystem::path& file) {
+    std::string ext = file.extension().string();
+    return ext == ".ts" || ext == ".tsx" || ext == ".jsx";
+}
+
+// Compile TypeScript/TSX/JSX to JavaScript using esbuild or tsc
+std::optional<std::filesystem::path> compile_to_js(const std::filesystem::path& source_file) {
+    namespace fs = std::filesystem;
+    
+    // Create output directory
+    fs::path dist_dir = ".qw/dist";
+    fs::create_directories(dist_dir);
+    
+    // Output file path (same name but .js extension)
+    fs::path output_file = dist_dir / source_file.filename();
+    output_file.replace_extension(".js");
+    
+    // Try esbuild first (faster), then fall back to tsc
+    std::string source_path = source_file.string();
+    std::string output_path = output_file.string();
+    
+    // Check for esbuild in node_modules
+    fs::path esbuild_bin = "node_modules/.bin/esbuild";
+    fs::path npx_path = "/usr/bin/env";
+    
+    std::string cmd;
+    
+    if (fs::exists(esbuild_bin)) {
+        // Use local esbuild: fast bundler that handles TS/TSX/JSX
+        cmd = esbuild_bin.string() + 
+              " \"" + source_path + "\"" +
+              " --bundle"
+              " --format=esm"
+              " --platform=neutral"
+              " --target=es2020"
+              " --outfile=\"" + output_path + "\""
+              " --jsx=automatic"
+              " 2>&1";
+    } else {
+        // Fall back to npx esbuild
+        cmd = "npx esbuild"
+              " \"" + source_path + "\"" +
+              " --bundle"
+              " --format=esm"
+              " --platform=neutral"
+              " --target=es2020"
+              " --outfile=\"" + output_path + "\""
+              " --jsx=automatic"
+              " 2>&1";
+    }
+    
+    // Execute compilation
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "Failed to run compiler\n";
+        return std::nullopt;
+    }
+    
+    // Read output for error messages
+    std::string output;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+    
+    int status = pclose(pipe);
+    
+    if (status != 0) {
+        std::cerr << "Compilation failed:\n" << output << "\n";
+        return std::nullopt;
+    }
+    
+    // Check if output file was created
+    if (!fs::exists(output_file)) {
+        std::cerr << "Compilation did not produce output file\n";
+        return std::nullopt;
+    }
+    
+    return output_file;
+}
+}  // namespace
+
+void Server::reload_dev_handler() {
+    namespace fs = std::filesystem;
+    
+    fs::path source_file = config_.dev_handler_file;
+    fs::path file_to_load = source_file;
+    
+    // Check if we need to compile TypeScript/TSX/JSX
+    if (needs_compilation(source_file)) {
+        std::cout << "Compiling " << source_file << "...\n";
+        auto compiled = compile_to_js(source_file);
+        if (!compiled) {
+            std::cerr << "Failed to compile " << source_file << "\n";
+            return;
+        }
+        file_to_load = *compiled;
+        std::cout << "Compiled to " << file_to_load << "\n";
+    }
+    
+    // Read handler file (either original .js or compiled output)
+    std::ifstream file(file_to_load);
+    if (!file) {
+        std::cerr << "Failed to read handler file: " << file_to_load << "\n";
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << file.rdbuf();
+    std::string source = oss.str();
+    file.close();
+
+    if (source.empty()) {
+        std::cerr << "Handler file is empty: " << file_to_load << "\n";
+        return;
+    }
+
+    try {
+        std::string new_id = store_handler(source);
+        
+        {
+            std::unique_lock lock(dev_handler_mutex_);
+            dev_handler_id_ = new_id;
+        }
+        
+        std::cout << "Loaded handler: " << config_.dev_handler_file << " -> " << new_id << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to compile handler: " << e.what() << "\n";
+    }
+}
+
+void Server::watch_handler_file() {
+    namespace fs = std::filesystem;
+    
+    auto last_write_time = fs::last_write_time(config_.dev_handler_file);
+    
+    while (watcher_running_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        
+        if (!watcher_running_) break;
+        
+        try {
+            auto current_write_time = fs::last_write_time(config_.dev_handler_file);
+            
+            if (current_write_time != last_write_time) {
+                last_write_time = current_write_time;
+                std::cout << "\nFile changed, reloading...\n";
+                reload_dev_handler();
+            }
+        } catch (const std::exception& e) {
+            // File might be temporarily unavailable during save
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
 void Server::run() {
     running_ = true;
+
+    // Start file watcher in dev mode
+    if (config_.dev_mode) {
+        watcher_running_ = true;
+        file_watcher_thread_ = std::thread([this] { watch_handler_file(); });
+    }
 
     net::io_context ioc{static_cast<int>(config_.get_thread_count())};
 
@@ -454,6 +644,9 @@ void Server::run() {
     std::make_shared<Listener>(ioc, endpoint, *this, *handler_store_, *thread_pool_)->run();
 
     std::cout << "Server listening on " << config_.host << ":" << config_.port << "\n";
+    if (config_.dev_mode) {
+        std::cout << "Watching for changes to " << config_.dev_handler_file << "...\n";
+    }
 
     // Run the I/O context with multiple threads
     std::vector<std::thread> io_threads;
@@ -473,6 +666,15 @@ void Server::run() {
 void Server::stop() {
     if (running_) {
         running_ = false;
+        
+        // Stop file watcher
+        if (watcher_running_) {
+            watcher_running_ = false;
+            if (file_watcher_thread_.joinable()) {
+                file_watcher_thread_.join();
+            }
+        }
+        
         thread_pool_->shutdown();
     }
 }
