@@ -2149,6 +2149,134 @@ test_fetch_user_agent() {
 }
 
 # =============================================================================
+# POLYFILL TESTS
+# =============================================================================
+
+# Test: All polyfills work (URL, URLSearchParams, structuredClone, atob, btoa, queueMicrotask, Set methods)
+test_polyfills_comprehensive() {
+    local handler='export default function(req) {
+    const results = {};
+    
+    // Test URL
+    try {
+        const url = new URL("https://example.com/path?foo=bar&baz=qux");
+        results.url = {
+            ok: true,
+            hostname: url.hostname,
+            pathname: url.pathname,
+            searchParams: url.searchParams.get("foo")
+        };
+    } catch(e) {
+        results.url = { ok: false, error: e.message };
+    }
+    
+    // Test URLSearchParams
+    try {
+        const params = new URLSearchParams("a=1&b=2&c=3");
+        results.urlSearchParams = {
+            ok: true,
+            a: params.get("a"),
+            has_b: params.has("b"),
+            entries: [...params.entries()].length
+        };
+    } catch(e) {
+        results.urlSearchParams = { ok: false, error: e.message };
+    }
+    
+    // Test structuredClone
+    try {
+        const obj = { a: 1, b: [2, 3], c: { d: 4 } };
+        const clone = structuredClone(obj);
+        clone.a = 100;
+        results.structuredClone = {
+            ok: true,
+            originalUnchanged: obj.a === 1,
+            cloneChanged: clone.a === 100,
+            deepClone: clone.c.d === 4
+        };
+    } catch(e) {
+        results.structuredClone = { ok: false, error: e.message };
+    }
+    
+    // Test btoa/atob
+    try {
+        const original = "Hello, World! 123";
+        const encoded = btoa(original);
+        const decoded = atob(encoded);
+        results.base64 = {
+            ok: true,
+            encoded: encoded,
+            roundTrip: decoded === original
+        };
+    } catch(e) {
+        results.base64 = { ok: false, error: e.message };
+    }
+    
+    // Test queueMicrotask
+    try {
+        results.queueMicrotask = {
+            ok: typeof queueMicrotask === "function",
+            type: typeof queueMicrotask
+        };
+    } catch(e) {
+        results.queueMicrotask = { ok: false, error: e.message };
+    }
+    
+    // Test Set methods (ES2025)
+    try {
+        const setA = new Set([1, 2, 3, 4]);
+        const setB = new Set([3, 4, 5, 6]);
+        
+        const hasUnion = typeof setA.union === "function";
+        const hasIntersection = typeof setA.intersection === "function";
+        const hasDifference = typeof setA.difference === "function";
+        const hasSymmetricDifference = typeof setA.symmetricDifference === "function";
+        const hasIsSubsetOf = typeof setA.isSubsetOf === "function";
+        const hasIsSupersetOf = typeof setA.isSupersetOf === "function";
+        const hasIsDisjointFrom = typeof setA.isDisjointFrom === "function";
+        
+        results.setMethods = {
+            ok: hasUnion && hasIntersection && hasDifference,
+            union: hasUnion ? [...setA.union(setB)].sort().join(",") : null,
+            intersection: hasIntersection ? [...setA.intersection(setB)].sort().join(",") : null,
+            difference: hasDifference ? [...setA.difference(setB)].sort().join(",") : null,
+            symmetricDifference: hasSymmetricDifference ? [...setA.symmetricDifference(setB)].sort().join(",") : null,
+            isSubsetOf: hasIsSubsetOf,
+            isSupersetOf: hasIsSupersetOf,
+            isDisjointFrom: hasIsDisjointFrom
+        };
+    } catch(e) {
+        results.setMethods = { ok: false, error: e.message };
+    }
+    
+    // Summary
+    results.allPassed = results.url.ok && 
+                        results.urlSearchParams.ok && 
+                        results.structuredClone.ok && 
+                        results.base64.ok && 
+                        results.queueMicrotask.ok && 
+                        results.setMethods.ok;
+    
+    return Response.json(results);
+}'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler "$id")
+    
+    # Check all polyfills work
+    assert_contains "$response" '"allPassed":true' && \
+    assert_contains "$response" '"hostname":"example.com"' && \
+    assert_contains "$response" '"roundTrip":true' && \
+    assert_contains "$response" '"union":"1,2,3,4,5,6"' && \
+    assert_contains "$response" '"intersection":"3,4"' && \
+    assert_contains "$response" '"difference":"1,2"'
+}
+
+# =============================================================================
 # KV STORE TESTS
 # =============================================================================
 
@@ -2902,6 +3030,9 @@ main() {
     run_test "RegExp named capture groups" test_regexp_named_groups
     run_test "Object.entries/fromEntries round-trip" test_object_entries_roundtrip
     run_test "Class with private fields (ES2022)" test_class_private_fields
+    
+    log_section "Polyfill Tests"
+    run_test "All polyfills (URL, base64, Set methods, etc)" test_polyfills_comprehensive
     
     log_section "KV Store Tests"
     run_test "KV basic set and get" test_kv_basic_set_get
