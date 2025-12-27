@@ -594,11 +594,8 @@ std::string ModuleResolver::get_polyfill_imports() {
     return R"(
 import "https://esm.sh/core-js/actual/url";
 import "https://esm.sh/core-js/actual/url-search-params";
-import "https://esm.sh/core-js/actual/structured-clone";
 import "https://esm.sh/core-js/actual/atob";
 import "https://esm.sh/core-js/actual/btoa";
-import "https://esm.sh/core-js/actual/queue-microtask";
-import "https://esm.sh/core-js/actual/set";
 )";}
 
 
