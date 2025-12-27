@@ -154,10 +154,10 @@ std::string HandlerStore::compute_hash(std::string_view source) {
     SHA256(reinterpret_cast<const unsigned char*>(source.data()),
            source.size(), hash);
 
-    // Use first 8 bytes (16 hex chars) for shorter IDs
+    // Use first 16 bytes (32 hex chars) for handler IDs
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 16; i++) {
         oss << std::setw(2) << static_cast<int>(hash[i]);
     }
     return oss.str();
