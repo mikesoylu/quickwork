@@ -33,15 +33,6 @@ std::string get_base_url(const std::string& url) {
     return path + "/";
 }
 
-// Extract hostname from URL
-std::string get_host(const std::string& url) {
-    size_t start = url.find("://");
-    if (start == std::string::npos) return "";
-    start += 3;
-    size_t end = url.find('/', start);
-    return url.substr(start, end - start);
-}
-
 }  // namespace
 
 bool ModuleResolver::is_remote_url(const std::string& specifier) {
