@@ -477,7 +477,7 @@ bool needs_compilation(const std::filesystem::path& file) {
     return ext == ".ts" || ext == ".tsx" || ext == ".jsx";
 }
 
-// Compile TypeScript/TSX/JSX to JavaScript using esbuild or tsc
+// Compile TypeScript/TSX/JSX to JavaScript using esbuild
 std::optional<std::filesystem::path> compile_to_js(const std::filesystem::path& source_file) {
     namespace fs = std::filesystem;
     
@@ -489,39 +489,90 @@ std::optional<std::filesystem::path> compile_to_js(const std::filesystem::path& 
     fs::path output_file = dist_dir / source_file.filename();
     output_file.replace_extension(".js");
     
-    // Try esbuild first (faster), then fall back to tsc
     std::string source_path = source_file.string();
     std::string output_path = output_file.string();
     
+    // Create polyfill shim file for React DOM compatibility
+    // This provides MessageChannel and other APIs needed by React's server renderer
+    fs::path shim_file = dist_dir / "_qw_shim.js";
+    {
+        std::ofstream shim(shim_file);
+        shim << R"JS(// QuickWork React DOM compatibility shim
+if (typeof MessageChannel === 'undefined') {
+    globalThis.MessageChannel = class MessageChannel {
+        constructor() {
+            this.port1 = { postMessage: () => {}, onmessage: null, close: () => {} };
+            this.port2 = { postMessage: () => {}, onmessage: null, close: () => {} };
+            // Connect ports
+            this.port1.postMessage = (msg) => {
+                if (this.port2.onmessage) {
+                    setTimeout(() => this.port2.onmessage({ data: msg }), 0);
+                }
+            };
+            this.port2.postMessage = (msg) => {
+                if (this.port1.onmessage) {
+                    setTimeout(() => this.port1.onmessage({ data: msg }), 0);
+                }
+            };
+        }
+    };
+}
+
+if (typeof setImmediate === 'undefined') {
+    globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 0, ...args);
+    globalThis.clearImmediate = (id) => clearTimeout(id);
+}
+
+if (typeof queueMicrotask === 'undefined') {
+    globalThis.queueMicrotask = (fn) => Promise.resolve().then(fn);
+}
+
+// Mark this as NOT a React Server Components environment
+// This allows react-dom/server to be used normally
+globalThis.__REACT_SERVER_CONTEXT__ = false;
+)JS";
+        shim.close();
+    }
+    
+    // Create alias file to redirect react-dom/server to the static build
+    fs::path alias_file = dist_dir / "_qw_alias.json";
+    {
+        std::ofstream alias(alias_file);
+        alias << R"JSON({
+  "react-dom/server": "react-dom/server.browser"
+}
+)JSON";
+        alias.close();
+    }
+    
     // Check for esbuild in node_modules
     fs::path esbuild_bin = "node_modules/.bin/esbuild";
-    fs::path npx_path = "/usr/bin/env";
     
-    std::string cmd;
+    std::string esbuild_cmd = fs::exists(esbuild_bin) ? esbuild_bin.string() : "npx esbuild";
     
-    if (fs::exists(esbuild_bin)) {
-        // Use local esbuild: fast bundler that handles TS/TSX/JSX
-        cmd = esbuild_bin.string() + 
-              " \"" + source_path + "\"" +
-              " --bundle"
-              " --format=esm"
-              " --platform=neutral"
-              " --target=es2020"
-              " --outfile=\"" + output_path + "\""
-              " --jsx=automatic"
-              " 2>&1";
-    } else {
-        // Fall back to npx esbuild
-        cmd = "npx esbuild"
-              " \"" + source_path + "\"" +
-              " --bundle"
-              " --format=esm"
-              " --platform=neutral"
-              " --target=es2020"
-              " --outfile=\"" + output_path + "\""
-              " --jsx=automatic"
-              " 2>&1";
-    }
+    // Build esbuild command with browser-compatible settings
+    // - platform=browser: Use browser builds of packages (avoids Node.js-specific code)
+    // - format=esm: Output ES modules
+    // - bundle: Bundle all dependencies
+    // - jsx=automatic: Use the new JSX transform (React 17+)
+    // - inject: Include our shim file to polyfill MessageChannel etc.
+    // - alias: Redirect react-dom/server to browser build to avoid RSC errors
+    std::string cmd = esbuild_cmd +
+          " \"" + source_path + "\"" +
+          " --bundle"
+          " --format=esm"
+          " --platform=browser"
+          " --target=es2020"
+          " --outfile=\"" + output_path + "\""
+          " --jsx=automatic"
+          " --jsx-import-source=react"
+          " --inject:\"" + shim_file.string() + "\""
+          " --alias:react-dom/server=react-dom/server.browser"
+          " --conditions=browser,import,default"
+          " --main-fields=browser,module,main"
+          " --loader:.js=jsx"
+          " --define:process.env.NODE_ENV=\\\"production\\\""
+          " 2>&1";
     
     // Execute compilation
     FILE* pipe = popen(cmd.c_str(), "r");

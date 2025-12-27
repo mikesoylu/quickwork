@@ -70,6 +70,128 @@ void ensure_gitignore_entry() {
     
     std::cout << "Added .qw/ to .gitignore\n";
 }
+
+// Initialize project for QuickWork dev mode with TypeScript/TSX support
+int run_init() {
+    namespace fs = std::filesystem;
+    
+    std::cout << "Initializing QuickWork project...\n\n";
+    
+    // Create tsconfig.json for TypeScript support
+    fs::path tsconfig_path = "tsconfig.json";
+    if (!fs::exists(tsconfig_path)) {
+        std::ofstream tsconfig(tsconfig_path);
+        if (tsconfig) {
+            tsconfig << R"({
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": ".qw/dist",
+    "declaration": false,
+    "noEmit": true
+  },
+  "include": ["*.ts", "*.tsx", "src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", ".qw"]
+}
+)";
+            tsconfig.close();
+            std::cout << "Created tsconfig.json\n";
+        } else {
+            std::cerr << "Warning: Could not create tsconfig.json\n";
+        }
+    } else {
+        std::cout << "tsconfig.json already exists, skipping\n";
+    }
+    
+    // Create .gitignore if it doesn't exist
+    fs::path gitignore_path = ".gitignore";
+    bool gitignore_existed = fs::exists(gitignore_path);
+    if (!gitignore_existed) {
+        std::ofstream gitignore(gitignore_path);
+        if (gitignore) {
+            gitignore << "node_modules/\n.qw/\n";
+            gitignore.close();
+            std::cout << "Created .gitignore\n";
+        }
+    } else {
+        ensure_gitignore_entry();
+    }
+    
+    // Create a sample handler if no .ts/.tsx/.js files exist
+    bool has_handler = false;
+    for (const auto& entry : fs::directory_iterator(".")) {
+        if (entry.is_regular_file()) {
+            std::string ext = entry.path().extension().string();
+            if (ext == ".ts" || ext == ".tsx" || ext == ".js" || ext == ".jsx") {
+                has_handler = true;
+                break;
+            }
+        }
+    }
+    
+    if (!has_handler) {
+        fs::path handler_path = "index.tsx";
+        std::ofstream handler(handler_path);
+        if (handler) {
+            handler << R"(// QuickWork handler with React JSX support
+// Run with: quickw --dev index.tsx
+
+interface Request {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+}
+
+export default function handler(req: Request): Response {
+  const name = new URL(req.url, "http://localhost").searchParams.get("name") || "World";
+  
+  return new Response(
+    `<!DOCTYPE html>
+<html>
+<head><title>QuickWork</title></head>
+<body>
+  <h1>Hello, ${name}!</h1>
+  <p>Method: ${req.method}</p>
+</body>
+</html>`,
+    {
+      headers: { "Content-Type": "text/html" }
+    }
+  );
+}
+)";
+            handler.close();
+            std::cout << "Created index.tsx (sample handler)\n";
+        }
+    }
+    
+    // Check for package.json and suggest installing esbuild
+    fs::path package_json = "package.json";
+    if (!fs::exists(package_json)) {
+        std::cout << "\nTo complete setup, run:\n";
+        std::cout << "  npm init -y\n";
+        std::cout << "  npm install -D esbuild typescript @types/react\n";
+    } else {
+        // Check if esbuild is installed
+        fs::path esbuild_bin = "node_modules/.bin/esbuild";
+        if (!fs::exists(esbuild_bin)) {
+            std::cout << "\nTo complete setup, run:\n";
+            std::cout << "  npm install -D esbuild typescript @types/react\n";
+        }
+    }
+    
+    std::cout << "\nQuickWork project initialized!\n";
+    std::cout << "Run with: quickw --dev index.tsx\n";
+    
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -79,8 +201,9 @@ int main(int argc, char* argv[]) {
     po::options_description desc("QuickWork - Multithreaded QuickJS Web Server");
     desc.add_options()
         ("help,h", "Show help message")
+        ("init", "Initialize project for QuickWork dev mode (creates tsconfig.json, etc.)")
         ("dev,d", po::value<std::string>(&dev_file),
-            "Dev mode: watch handler file and auto-reload on changes")
+            "Dev mode: watch handler file and auto-reload on changes (supports .ts, .tsx, .jsx)")
         ("host,H", po::value<std::string>(&config.host)->default_value("0.0.0.0"),
             "Host to bind to")
         ("port,p", po::value<uint16_t>(&config.port)->default_value(8080),
@@ -114,15 +237,22 @@ int main(int argc, char* argv[]) {
     if (vm.count("help")) {
         std::cout << desc << "\n";
         std::cout << "\nUsage:\n";
-        std::cout << "  # Start the server\n";
-        std::cout << "  ./quickwork -p 8080\n\n";
-        std::cout << "  # Dev mode with auto-reload\n";
-        std::cout << "  ./quickwork --dev handler.js\n\n";
+        std::cout << "  # Initialize a new project\n";
+        std::cout << "  quickw --init\n\n";
+        std::cout << "  # Dev mode with auto-reload (TypeScript/TSX/JSX supported)\n";
+        std::cout << "  quickw --dev handler.tsx\n\n";
+        std::cout << "  # Start the production server\n";
+        std::cout << "  quickw -p 8080\n\n";
         std::cout << "  # Register a handler (POST without x-handler-id)\n";
         std::cout << R"(  curl -X POST http://localhost:8080 -d 'export default (req) => new Response("Hello!")')" << "\n\n";
         std::cout << "  # Execute a handler (any method with x-handler-id)\n";
         std::cout << "  curl http://localhost:8080 -H 'x-handler-id: <id>'\n";
         return 0;
+    }
+
+    // Handle init command
+    if (vm.count("init")) {
+        return run_init();
     }
 
     // Handle dev mode
