@@ -17,7 +17,7 @@ for arg in "$@"; do
             ;;
         *)
             echo "Usage: ./build.sh [--install] [Debug|Release]"
-            echo "  --install    Link binary to ~/.local/bin/quickw"
+            echo "  --install    Link binary to ~/.local/bin/quickwork"
             echo "  Debug        Build with debug symbols"
             echo "  Release      Build optimized (default)"
             exit 1
@@ -41,12 +41,12 @@ if [ "$INSTALL" = true ]; then
     mkdir -p "$INSTALL_DIR"
     
     # Remove existing link/file if present
-    rm -f "$INSTALL_DIR/quickw"
+    rm -f "$INSTALL_DIR/quickwork"
     
     # Create symlink
-    ln -s "$(pwd)/$BUILD_DIR/quickwork" "$INSTALL_DIR/quickw"
+    ln -s "$(pwd)/$BUILD_DIR/quickwork" "$INSTALL_DIR/quickwork"
     
-    echo "Installed: $INSTALL_DIR/quickw -> $(pwd)/$BUILD_DIR/quickwork"
+    echo "Installed: $INSTALL_DIR/quickwork -> $(pwd)/$BUILD_DIR/quickwork"
     
     # Check if ~/.local/bin is in PATH
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

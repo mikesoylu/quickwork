@@ -141,7 +141,7 @@ int run_init() {
         std::ofstream handler(handler_path);
         if (handler) {
             handler << R"(// QuickWork handler with React JSX support
-// Run with: quickw --dev index.tsx
+// Run with: quickwork --dev index.tsx
 
 interface Request {
   method: string;
@@ -189,7 +189,7 @@ export default function handler(req: Request): Response {
     }
     
     std::cout << "\nQuickWork project initialized!\n";
-    std::cout << "Run with: quickw --dev index.tsx\n";
+    std::cout << "Run with: quickwork --dev index.tsx\n";
     
     return 0;
 }
@@ -239,11 +239,11 @@ int main(int argc, char* argv[]) {
         std::cout << desc << "\n";
         std::cout << "\nUsage:\n";
         std::cout << "  # Initialize a new project\n";
-        std::cout << "  quickw --init\n\n";
+        std::cout << "  quickwork --init\n\n";
         std::cout << "  # Dev mode with auto-reload (TypeScript/TSX/JSX supported)\n";
-        std::cout << "  quickw --dev handler.tsx\n\n";
+        std::cout << "  quickwork --dev handler.tsx\n\n";
         std::cout << "  # Start the production server\n";
-        std::cout << "  quickw -p 8080\n\n";
+        std::cout << "  quickwork -p 8080\n\n";
         std::cout << "  # Register a handler (POST without x-handler-id)\n";
         std::cout << R"(  curl -X POST http://localhost:8080 -d 'export default (req) => new Response("Hello!")')" << "\n\n";
         std::cout << "  # Execute a handler (any method with x-handler-id)\n";

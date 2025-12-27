@@ -1,12 +1,16 @@
-# QuickWork
+# quickwork
 
-A minimalist serverless QuickJS runtime.
+**⚠️ Experimental: This project is under active development. APIs may change.**
+
+An attempt at making the fastest possible serverless JavaScript runtime for live AI/LLM backends.
 
 ## Features
 
-- Near instant cold starts
+- REALLY fast cold starts and low-latency execution
 - Multithreaded QuickJS runtime with request isolation
 - Configurable memory and CPU limits per request
+- Dev mode with TypeScript/TSX/JSX support and hot-reload
+- ESM imports from URLs (esm.sh) at compile-time for LLM use cases
 
 ## Building
 
@@ -16,9 +20,8 @@ Requirements:
 - OpenSSL
 
 ```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
+./build.sh              # Build only
+./build.sh --install    # Build and link to ~/.local/bin/quickwork
 ```
 
 ## Usage
@@ -26,10 +29,12 @@ make -j$(nproc)
 ### Starting the Server
 
 ```bash
-./quickwork [options]
+quickwork [options]
 
 Options:
   -h [ --help ]                        Show help message
+  --init                               Initialize project for dev mode
+  -d [ --dev ] arg                     Dev mode: watch handler file and auto-reload
   -H [ --host ] arg (=0.0.0.0)         Host to bind to
   -p [ --port ] arg (=8080)            Port to listen on
   -c [ --cache-dir ] arg (=./handlers) Handler cache directory
@@ -38,9 +43,69 @@ Options:
   -j [ --threads ] arg (=0)            Number of worker threads (0 = auto)
   -s [ --cache-size ] arg (=1024)      Max handlers in memory cache (LRU)
   -S [ --max-storage ] arg (=0)        Max disk storage for bytecode cache in MB (0 = unlimited)
+  -k [ --kv-size ] arg (=10240)        Max entries in shared KV store (LRU eviction)
 ```
 
-### Registering a Handler
+### Dev Mode
+
+Dev mode provides a fast development experience intended for CLI Agents with TypeScript/TSX/JSX support and automatic reloading.
+
+#### Initialize a Project
+
+```bash
+quickwork --init
+```
+
+This creates:
+- `tsconfig.json` - TypeScript configuration optimized for quickwork
+- `index.tsx` - Sample handler (if no handler exists)
+- `.gitignore` - Ignores `.qw/` directory
+
+#### Run in Dev Mode
+
+```bash
+quickwork --dev index.tsx
+```
+
+Features:
+- **Auto-reload**: Automatically recompiles and reloads when the file changes
+- **TypeScript/TSX/JSX**: Compiled via esbuild with React JSX support
+- **No x-handler-id needed**: All requests go to the dev handler
+- **URL imports**: Import from `https://esm.sh/*` URLs
+
+#### Example TypeScript Handler
+
+```typescript
+import { renderToString } from 'https://esm.sh/react-dom/server';
+import { nanoid } from 'https://esm.sh/nanoid';
+
+function App() {
+  return (
+    <html>
+      <head><title>Hello {nanoid(8)}</title></head>
+      <body><h1>Hello World!</h1></body>
+    </html>
+  );
+}
+
+export default async function handler(req: Request): Promise<Response> {
+  const html = renderToString(<App />);
+  return new Response(`<!DOCTYPE html>${html}`, {
+    headers: { 'Content-Type': 'text/html' },
+  });
+}
+```
+
+#### Requirements for Dev Mode
+
+Dev mode requires `esbuild` for TypeScript/JSX compilation:
+
+```bash
+npm init -y
+npm install -D esbuild typescript @types/react
+```
+
+### Production Mode (JS Only)
 
 POST a JavaScript handler without the `x-handler-id` header:
 
@@ -64,7 +129,7 @@ curl http://localhost:8080 -H "x-handler-id: abc123..."
 
 ## Handler API
 
-Handlers are JavaScript functions that receive a Request and return a Response. QuickWork compiles handlers to bytecode on registration for fast execution.
+Handlers are JavaScript functions that receive a Request and return a Response. quickwork compiles handlers to bytecode on registration for fast execution.
 
 ### Request Object
 
@@ -243,9 +308,47 @@ export default function(req) {
 }
 ```
 
+### Available Polyfills
+
+quickwork provides the following Web API polyfills in the runtime:
+
+**Scheduling & Communication:**
+- `MessageChannel` / `MessagePort` - For message passing (used by React scheduler)
+- `setImmediate` / `clearImmediate` - Immediate execution scheduling
+- `queueMicrotask` - Microtask scheduling
+
+**Streams:**
+- `ReadableStream` - Readable byte streams with async iteration support
+- `WritableStream` - Writable byte streams
+- `TransformStream` - Transform streams for piping
+- `ByteLengthQueuingStrategy` / `CountQueuingStrategy` - Backpressure strategies
+
+**Data:**
+- `Blob` - Binary large objects with `text()`, `arrayBuffer()`, `stream()` methods
+- `TextEncoder` / `TextDecoder` - UTF-8 encoding/decoding
+
+### Built-in Modules
+
+#### KV Store
+
+quickwork includes a built-in in-memory key-value store shared across all handlers on a given server. It supports LRU eviction based on the configured max entries.
+
+```javascript
+import { kv } from "quickw";
+
+export default async function(req) {
+  // Set a value
+  await kv.set("myKey", "myValue", 1000); // optional TTL in seconds
+
+  // ...
+}
+```
+
+> See `tests/run_tests.sh` for usage examples.
+
 ## Docker Deployment
 
-QuickWork can be deployed using Docker. You can either use the provided Dockerfile directly or build it as part of a multi-stage build in your own project.
+quickwork can be deployed using Docker. You can either use the provided Dockerfile directly or build it as part of a multi-stage build in your own project.
 
 ### Using the Dockerfile
 
@@ -259,10 +362,10 @@ docker run -d -p 8080:8080 -v handlers:/data/handlers quickwork
 
 ### Multi-stage Build from Git
 
-To include QuickWork in your own Docker image, you can clone and build it in a multi-stage build:
+To include quickwork in your own Docker image, you can clone and build it in a multi-stage build:
 
 ```dockerfile
-# Build stage - compile QuickWork from source
+# Build stage - compile quickwork from source
 FROM alpine:3.20 AS quickwork-builder
 
 RUN apk add --no-cache \
@@ -277,7 +380,7 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-# Clone and build QuickWork
+# Clone and build quickwork
 RUN git clone --depth 1 https://github.com/mikesoylu/quickwork.git . && \
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
@@ -296,7 +399,7 @@ RUN apk add --no-cache \
     libcrypto3 \
     ca-certificates
 
-# Copy QuickWork binary
+# Copy quickwork binary
 COPY --from=quickwork-builder /build/build/quickwork /usr/local/bin/quickwork
 
 # Copy your application files
@@ -326,9 +429,11 @@ docker run -d -p 8080:8080 \
     quickwork
 ```
 
+> Note: Maximize threads (ie `-j 16` per vCPU) in production for best performance.
+
 ### Health Check
 
-QuickWork provides a built-in health check endpoint at `GET /health`:
+quickwork provides a built-in health check endpoint at `GET /health`:
 
 ```bash
 curl http://localhost:8080/health
