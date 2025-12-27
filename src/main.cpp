@@ -84,9 +84,10 @@ int run_init() {
         if (tsconfig) {
             tsconfig << R"({
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
     "jsx": "react-jsx",
     "strict": true,
     "esModuleInterop": true,
