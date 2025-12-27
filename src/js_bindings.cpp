@@ -2098,4 +2098,1032 @@ void setup_kv_module(JSContext* ctx) {
     JS_FreeValue(ctx, global);
 }
 
+// ============================================================================
+// Web Streams and Blob Polyfills (Pure JavaScript implementation)
+// ============================================================================
+
+static const char* streams_polyfill_source = R"JS(
+// ============================================================================
+// Blob Implementation
+// ============================================================================
+(function(globalThis) {
+    'use strict';
+
+    class Blob {
+        #parts = [];
+        #type = '';
+        #size = 0;
+
+        constructor(blobParts = [], options = {}) {
+            this.#type = options.type ? String(options.type).toLowerCase() : '';
+            
+            for (const part of blobParts) {
+                if (part instanceof Blob) {
+                    // Copy data from another Blob
+                    this.#parts.push(...part.#parts);
+                    this.#size += part.size;
+                } else if (part instanceof ArrayBuffer) {
+                    const copy = new Uint8Array(part).slice();
+                    this.#parts.push(copy);
+                    this.#size += copy.length;
+                } else if (ArrayBuffer.isView(part)) {
+                    const copy = new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice();
+                    this.#parts.push(copy);
+                    this.#size += copy.length;
+                } else {
+                    // Convert to string
+                    const str = String(part);
+                    const encoder = new TextEncoder();
+                    const encoded = encoder.encode(str);
+                    this.#parts.push(encoded);
+                    this.#size += encoded.length;
+                }
+            }
+        }
+
+        get size() {
+            return this.#size;
+        }
+
+        get type() {
+            return this.#type;
+        }
+
+        async text() {
+            const buffer = await this.arrayBuffer();
+            const decoder = new TextDecoder();
+            return decoder.decode(buffer);
+        }
+
+        async arrayBuffer() {
+            const result = new Uint8Array(this.#size);
+            let offset = 0;
+            for (const part of this.#parts) {
+                result.set(part, offset);
+                offset += part.length;
+            }
+            return result.buffer;
+        }
+
+        async bytes() {
+            const buffer = await this.arrayBuffer();
+            return new Uint8Array(buffer);
+        }
+
+        slice(start = 0, end = this.#size, contentType = '') {
+            // Normalize start and end
+            if (start < 0) start = Math.max(this.#size + start, 0);
+            if (end < 0) end = Math.max(this.#size + end, 0);
+            start = Math.min(start, this.#size);
+            end = Math.min(end, this.#size);
+            
+            if (start >= end) {
+                return new Blob([], { type: contentType });
+            }
+
+            // Collect the bytes in the range
+            const resultParts = [];
+            let currentOffset = 0;
+            
+            for (const part of this.#parts) {
+                const partStart = currentOffset;
+                const partEnd = currentOffset + part.length;
+                
+                if (partEnd <= start) {
+                    currentOffset = partEnd;
+                    continue;
+                }
+                
+                if (partStart >= end) {
+                    break;
+                }
+                
+                // Calculate slice within this part
+                const sliceStart = Math.max(0, start - partStart);
+                const sliceEnd = Math.min(part.length, end - partStart);
+                
+                resultParts.push(part.slice(sliceStart, sliceEnd));
+                currentOffset = partEnd;
+            }
+
+            return new Blob(resultParts, { type: contentType });
+        }
+
+        stream() {
+            const parts = this.#parts;
+            let partIndex = 0;
+            
+            return new ReadableStream({
+                pull(controller) {
+                    if (partIndex >= parts.length) {
+                        controller.close();
+                        return;
+                    }
+                    controller.enqueue(parts[partIndex++]);
+                }
+            });
+        }
+    }
+
+    // ============================================================================
+    // ReadableStream Implementation
+    // ============================================================================
+    
+    const ReadableStreamState = {
+        READABLE: 'readable',
+        CLOSED: 'closed',
+        ERRORED: 'errored'
+    };
+
+    class ReadableStreamDefaultReader {
+        #stream = null;
+        #closedPromise = null;
+        #closedResolve = null;
+        #closedReject = null;
+
+        constructor(stream) {
+            if (stream._reader) {
+                throw new TypeError('ReadableStream is already locked');
+            }
+            this.#stream = stream;
+            stream._reader = this;
+            
+            this.#closedPromise = new Promise((resolve, reject) => {
+                this.#closedResolve = resolve;
+                this.#closedReject = reject;
+            });
+
+            if (stream._state === ReadableStreamState.CLOSED) {
+                this.#closedResolve(undefined);
+            } else if (stream._state === ReadableStreamState.ERRORED) {
+                this.#closedReject(stream._storedError);
+            }
+        }
+
+        get closed() {
+            return this.#closedPromise;
+        }
+
+        async read() {
+            if (!this.#stream) {
+                return Promise.reject(new TypeError('Reader has been released'));
+            }
+
+            const stream = this.#stream;
+
+            if (stream._state === ReadableStreamState.CLOSED) {
+                return { done: true, value: undefined };
+            }
+
+            if (stream._state === ReadableStreamState.ERRORED) {
+                throw stream._storedError;
+            }
+
+            // Check queue first
+            if (stream._queue.length > 0) {
+                const chunk = stream._queue.shift();
+                stream._queueTotalSize -= chunk.byteLength || chunk.length || 1;
+                
+                if (stream._closeRequested && stream._queue.length === 0) {
+                    stream._state = ReadableStreamState.CLOSED;
+                    this.#closedResolve(undefined);
+                } else if (stream._underlyingSource && stream._underlyingSource.pull) {
+                    // Pull more data
+                    try {
+                        await stream._underlyingSource.pull(stream._controller);
+                    } catch (e) {
+                        stream._state = ReadableStreamState.ERRORED;
+                        stream._storedError = e;
+                        this.#closedReject(e);
+                        throw e;
+                    }
+                }
+                
+                return { done: false, value: chunk };
+            }
+
+            // Queue is empty, need to pull
+            if (stream._underlyingSource && stream._underlyingSource.pull) {
+                return new Promise(async (resolve, reject) => {
+                    stream._pendingReads.push({ resolve, reject });
+                    
+                    try {
+                        await stream._underlyingSource.pull(stream._controller);
+                    } catch (e) {
+                        stream._state = ReadableStreamState.ERRORED;
+                        stream._storedError = e;
+                        this.#closedReject(e);
+                        reject(e);
+                    }
+                });
+            }
+
+            // No pull function and queue is empty
+            if (stream._closeRequested) {
+                stream._state = ReadableStreamState.CLOSED;
+                this.#closedResolve(undefined);
+                return { done: true, value: undefined };
+            }
+
+            // Wait for data to be enqueued
+            return new Promise((resolve, reject) => {
+                stream._pendingReads.push({ resolve, reject });
+            });
+        }
+
+        releaseLock() {
+            if (!this.#stream) return;
+            this.#stream._reader = null;
+            this.#stream = null;
+        }
+
+        cancel(reason) {
+            if (!this.#stream) {
+                return Promise.reject(new TypeError('Reader has been released'));
+            }
+            return this.#stream.cancel(reason);
+        }
+
+        _close() {
+            this.#closedResolve(undefined);
+        }
+
+        _error(e) {
+            this.#closedReject(e);
+        }
+    }
+
+    class ReadableStreamDefaultController {
+        #stream = null;
+
+        constructor(stream) {
+            this.#stream = stream;
+        }
+
+        get desiredSize() {
+            const stream = this.#stream;
+            if (stream._state === ReadableStreamState.ERRORED) return null;
+            if (stream._state === ReadableStreamState.CLOSED) return 0;
+            return stream._highWaterMark - stream._queueTotalSize;
+        }
+
+        enqueue(chunk) {
+            const stream = this.#stream;
+            
+            if (stream._state !== ReadableStreamState.READABLE) {
+                throw new TypeError('Stream is not readable');
+            }
+            
+            if (stream._closeRequested) {
+                throw new TypeError('Stream is closing');
+            }
+
+            // If there are pending reads, fulfill them directly
+            if (stream._pendingReads.length > 0) {
+                const { resolve } = stream._pendingReads.shift();
+                resolve({ done: false, value: chunk });
+                return;
+            }
+
+            // Otherwise queue the chunk
+            stream._queue.push(chunk);
+            stream._queueTotalSize += chunk.byteLength || chunk.length || 1;
+        }
+
+        close() {
+            const stream = this.#stream;
+            
+            if (stream._state !== ReadableStreamState.READABLE) {
+                throw new TypeError('Stream is not readable');
+            }
+            
+            if (stream._closeRequested) {
+                throw new TypeError('Stream is already closing');
+            }
+
+            stream._closeRequested = true;
+
+            if (stream._queue.length === 0) {
+                stream._state = ReadableStreamState.CLOSED;
+                
+                // Resolve all pending reads with done
+                while (stream._pendingReads.length > 0) {
+                    const { resolve } = stream._pendingReads.shift();
+                    resolve({ done: true, value: undefined });
+                }
+                
+                if (stream._reader) {
+                    stream._reader._close();
+                }
+            }
+        }
+
+        error(e) {
+            const stream = this.#stream;
+            
+            if (stream._state !== ReadableStreamState.READABLE) {
+                return;
+            }
+
+            stream._state = ReadableStreamState.ERRORED;
+            stream._storedError = e;
+            stream._queue = [];
+            stream._queueTotalSize = 0;
+
+            // Reject all pending reads
+            while (stream._pendingReads.length > 0) {
+                const { reject } = stream._pendingReads.shift();
+                reject(e);
+            }
+
+            if (stream._reader) {
+                stream._reader._error(e);
+            }
+        }
+    }
+
+    class ReadableStream {
+        _state = ReadableStreamState.READABLE;
+        _reader = null;
+        _storedError = undefined;
+        _underlyingSource = null;
+        _controller = null;
+        _queue = [];
+        _queueTotalSize = 0;
+        _highWaterMark = 1;
+        _closeRequested = false;
+        _pendingReads = [];
+
+        constructor(underlyingSource = {}, strategy = {}) {
+            this._underlyingSource = underlyingSource;
+            this._highWaterMark = strategy.highWaterMark ?? 1;
+            this._controller = new ReadableStreamDefaultController(this);
+
+            if (underlyingSource.start) {
+                const result = underlyingSource.start(this._controller);
+                if (result && typeof result.then === 'function') {
+                    result.catch(e => this._controller.error(e));
+                }
+            }
+        }
+
+        get locked() {
+            return this._reader !== null;
+        }
+
+        async cancel(reason) {
+            if (this._reader) {
+                throw new TypeError('Cannot cancel a locked stream');
+            }
+
+            if (this._state === ReadableStreamState.CLOSED) {
+                return;
+            }
+
+            if (this._state === ReadableStreamState.ERRORED) {
+                throw this._storedError;
+            }
+
+            this._state = ReadableStreamState.CLOSED;
+            this._queue = [];
+            this._queueTotalSize = 0;
+
+            if (this._underlyingSource && this._underlyingSource.cancel) {
+                await this._underlyingSource.cancel(reason);
+            }
+        }
+
+        getReader(options = {}) {
+            if (options.mode === 'byob') {
+                throw new TypeError('BYOB readers are not supported');
+            }
+            return new ReadableStreamDefaultReader(this);
+        }
+
+        tee() {
+            if (this.locked) {
+                throw new TypeError('Cannot tee a locked stream');
+            }
+
+            const reader = this.getReader();
+            let reading = false;
+            let readAgain = false;
+            let canceled1 = false;
+            let canceled2 = false;
+            let reason1, reason2;
+            let branch1Controller, branch2Controller;
+            let branch1Closed = false;
+            let branch2Closed = false;
+
+            const pullAlgorithm = async () => {
+                if (reading) {
+                    readAgain = true;
+                    return;
+                }
+                reading = true;
+                
+                try {
+                    const { done, value } = await reader.read();
+                    reading = false;
+                    
+                    if (done) {
+                        if (!canceled1 && !branch1Closed) {
+                            branch1Closed = true;
+                            branch1Controller.close();
+                        }
+                        if (!canceled2 && !branch2Closed) {
+                            branch2Closed = true;
+                            branch2Controller.close();
+                        }
+                        return;
+                    }
+                    
+                    // Clone the chunk for both branches
+                    const chunk1 = value;
+                    let chunk2;
+                    if (value instanceof Uint8Array) {
+                        chunk2 = new Uint8Array(value);
+                    } else if (ArrayBuffer.isView(value)) {
+                        chunk2 = new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+                    } else {
+                        chunk2 = value;
+                    }
+                    
+                    if (!canceled1 && !branch1Closed) branch1Controller.enqueue(chunk1);
+                    if (!canceled2 && !branch2Closed) branch2Controller.enqueue(chunk2);
+                    
+                    if (readAgain) {
+                        readAgain = false;
+                        await pullAlgorithm();
+                    }
+                } catch (e) {
+                    reading = false;
+                    if (!branch1Closed) branch1Controller.error(e);
+                    if (!branch2Closed) branch2Controller.error(e);
+                }
+            };
+
+            const branch1 = new ReadableStream({
+                start(controller) {
+                    branch1Controller = controller;
+                },
+                pull: pullAlgorithm,
+                cancel(reason) {
+                    canceled1 = true;
+                    reason1 = reason;
+                    if (canceled2) {
+                        reader.cancel([reason1, reason2]);
+                    }
+                }
+            });
+
+            const branch2 = new ReadableStream({
+                start(controller) {
+                    branch2Controller = controller;
+                },
+                pull: pullAlgorithm,
+                cancel(reason) {
+                    canceled2 = true;
+                    reason2 = reason;
+                    if (canceled1) {
+                        reader.cancel([reason1, reason2]);
+                    }
+                }
+            });
+
+            return [branch1, branch2];
+        }
+
+        pipeThrough(transform, options = {}) {
+            if (this.locked) {
+                throw new TypeError('Cannot pipe a locked stream');
+            }
+            
+            this.pipeTo(transform.writable, options);
+            return transform.readable;
+        }
+
+        async pipeTo(destination, options = {}) {
+            if (this.locked) {
+                throw new TypeError('Cannot pipe a locked stream');
+            }
+            if (destination.locked) {
+                throw new TypeError('Cannot pipe to a locked stream');
+            }
+
+            const reader = this.getReader();
+            const writer = destination.getWriter();
+            const preventClose = options.preventClose === true;
+            const preventAbort = options.preventAbort === true;
+            const preventCancel = options.preventCancel === true;
+            const signal = options.signal;
+
+            let shuttingDown = false;
+
+            if (signal) {
+                if (signal.aborted) {
+                    throw signal.reason || new DOMException('Aborted', 'AbortError');
+                }
+                signal.addEventListener('abort', () => {
+                    shuttingDown = true;
+                });
+            }
+
+            try {
+                while (true) {
+                    if (shuttingDown) break;
+                    
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    await writer.write(value);
+                }
+                
+                if (!preventClose) {
+                    await writer.close();
+                }
+            } catch (e) {
+                if (!preventAbort) {
+                    await writer.abort(e);
+                }
+                if (!preventCancel) {
+                    await reader.cancel(e);
+                }
+                throw e;
+            } finally {
+                reader.releaseLock();
+                writer.releaseLock();
+            }
+        }
+
+        async *[Symbol.asyncIterator]() {
+            const reader = this.getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    yield value;
+                }
+            } finally {
+                reader.releaseLock();
+            }
+        }
+
+        // Static methods
+        static from(asyncIterable) {
+            return new ReadableStream({
+                async start(controller) {
+                    for await (const chunk of asyncIterable) {
+                        controller.enqueue(chunk);
+                    }
+                    controller.close();
+                }
+            });
+        }
+    }
+
+    // ============================================================================
+    // WritableStream Implementation
+    // ============================================================================
+
+    const WritableStreamState = {
+        WRITABLE: 'writable',
+        CLOSED: 'closed',
+        ERRORING: 'erroring',
+        ERRORED: 'errored'
+    };
+
+    class WritableStreamDefaultWriter {
+        #stream = null;
+        #closedPromise = null;
+        #closedResolve = null;
+        #closedReject = null;
+        #readyPromise = null;
+        #readyResolve = null;
+        #readyReject = null;
+
+        constructor(stream) {
+            if (stream._writer) {
+                throw new TypeError('WritableStream is already locked');
+            }
+            this.#stream = stream;
+            stream._writer = this;
+
+            this.#closedPromise = new Promise((resolve, reject) => {
+                this.#closedResolve = resolve;
+                this.#closedReject = reject;
+            });
+
+            this.#readyPromise = new Promise((resolve, reject) => {
+                this.#readyResolve = resolve;
+                this.#readyReject = reject;
+            });
+
+            if (stream._state === WritableStreamState.CLOSED) {
+                this.#closedResolve(undefined);
+                this.#readyResolve(undefined);
+            } else if (stream._state === WritableStreamState.ERRORED) {
+                this.#closedReject(stream._storedError);
+                this.#readyReject(stream._storedError);
+            } else {
+                this.#readyResolve(undefined);
+            }
+        }
+
+        get closed() {
+            return this.#closedPromise;
+        }
+
+        get ready() {
+            return this.#readyPromise;
+        }
+
+        get desiredSize() {
+            const stream = this.#stream;
+            if (!stream) return null;
+            if (stream._state === WritableStreamState.ERRORED) return null;
+            if (stream._state === WritableStreamState.CLOSED) return 0;
+            return stream._highWaterMark - stream._queueTotalSize;
+        }
+
+        async write(chunk) {
+            if (!this.#stream) {
+                throw new TypeError('Writer has been released');
+            }
+
+            const stream = this.#stream;
+
+            if (stream._state !== WritableStreamState.WRITABLE) {
+                if (stream._state === WritableStreamState.ERRORED) {
+                    throw stream._storedError;
+                }
+                throw new TypeError('Stream is not writable');
+            }
+
+            // Add to queue
+            stream._queue.push({ chunk });
+            stream._queueTotalSize += chunk.byteLength || chunk.length || 1;
+
+            // Process queue
+            return stream._processQueue();
+        }
+
+        async close() {
+            if (!this.#stream) {
+                throw new TypeError('Writer has been released');
+            }
+
+            const stream = this.#stream;
+
+            if (stream._state !== WritableStreamState.WRITABLE) {
+                throw new TypeError('Stream is not writable');
+            }
+
+            stream._closeRequested = true;
+
+            // Wait for queue to drain
+            await stream._processQueue();
+
+            // Call underlying close
+            if (stream._underlyingSink && stream._underlyingSink.close) {
+                await stream._underlyingSink.close(stream._controller);
+            }
+
+            stream._state = WritableStreamState.CLOSED;
+            this.#closedResolve(undefined);
+        }
+
+        async abort(reason) {
+            if (!this.#stream) {
+                throw new TypeError('Writer has been released');
+            }
+
+            return this.#stream.abort(reason);
+        }
+
+        releaseLock() {
+            if (!this.#stream) return;
+            this.#stream._writer = null;
+            this.#stream = null;
+        }
+
+        _close() {
+            this.#closedResolve(undefined);
+        }
+
+        _error(e) {
+            this.#closedReject(e);
+            this.#readyReject(e);
+        }
+    }
+
+    class WritableStreamDefaultController {
+        #stream = null;
+        #signal = null;
+
+        constructor(stream) {
+            this.#stream = stream;
+            // AbortController is used to signal abort to the underlying sink
+            if (typeof AbortController !== 'undefined') {
+                const controller = new AbortController();
+                this.#signal = controller.signal;
+            }
+        }
+
+        get signal() {
+            return this.#signal;
+        }
+
+        error(e) {
+            const stream = this.#stream;
+            
+            if (stream._state !== WritableStreamState.WRITABLE) {
+                return;
+            }
+
+            stream._state = WritableStreamState.ERRORED;
+            stream._storedError = e;
+            stream._queue = [];
+            stream._queueTotalSize = 0;
+
+            if (stream._writer) {
+                stream._writer._error(e);
+            }
+        }
+    }
+
+    class WritableStream {
+        _state = WritableStreamState.WRITABLE;
+        _writer = null;
+        _storedError = undefined;
+        _underlyingSink = null;
+        _controller = null;
+        _queue = [];
+        _queueTotalSize = 0;
+        _highWaterMark = 1;
+        _closeRequested = false;
+        _inFlightWriteRequest = null;
+        _pendingAbortRequest = null;
+
+        constructor(underlyingSink = {}, strategy = {}) {
+            this._underlyingSink = underlyingSink;
+            this._highWaterMark = strategy.highWaterMark ?? 1;
+            this._controller = new WritableStreamDefaultController(this);
+
+            if (underlyingSink.start) {
+                const result = underlyingSink.start(this._controller);
+                if (result && typeof result.then === 'function') {
+                    result.catch(e => this._controller.error(e));
+                }
+            }
+        }
+
+        get locked() {
+            return this._writer !== null;
+        }
+
+        async abort(reason) {
+            if (this._writer) {
+                throw new TypeError('Cannot abort a locked stream');
+            }
+
+            if (this._state === WritableStreamState.CLOSED) {
+                return;
+            }
+
+            if (this._state === WritableStreamState.ERRORED) {
+                throw this._storedError;
+            }
+
+            this._state = WritableStreamState.ERRORED;
+            this._storedError = reason;
+            this._queue = [];
+            this._queueTotalSize = 0;
+
+            if (this._underlyingSink && this._underlyingSink.abort) {
+                await this._underlyingSink.abort(reason);
+            }
+        }
+
+        async close() {
+            if (this._writer) {
+                throw new TypeError('Cannot close a locked stream');
+            }
+
+            if (this._state !== WritableStreamState.WRITABLE) {
+                throw new TypeError('Stream is not writable');
+            }
+
+            this._closeRequested = true;
+
+            // Wait for queue to drain
+            await this._processQueue();
+
+            if (this._underlyingSink && this._underlyingSink.close) {
+                await this._underlyingSink.close(this._controller);
+            }
+
+            this._state = WritableStreamState.CLOSED;
+        }
+
+        getWriter() {
+            return new WritableStreamDefaultWriter(this);
+        }
+
+        async _processQueue() {
+            if (this._state !== WritableStreamState.WRITABLE) {
+                return;
+            }
+
+            while (this._queue.length > 0) {
+                const { chunk } = this._queue.shift();
+                this._queueTotalSize -= chunk.byteLength || chunk.length || 1;
+
+                if (this._underlyingSink && this._underlyingSink.write) {
+                    try {
+                        await this._underlyingSink.write(chunk, this._controller);
+                    } catch (e) {
+                        this._controller.error(e);
+                        throw e;
+                    }
+                }
+            }
+        }
+    }
+
+    // ============================================================================
+    // TransformStream Implementation (bonus - useful for pipeThrough)
+    // ============================================================================
+
+    class TransformStream {
+        readable;
+        writable;
+
+        constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+            let readableController;
+            
+            this.readable = new ReadableStream({
+                start(controller) {
+                    readableController = controller;
+                }
+            }, readableStrategy);
+
+            const transformController = {
+                enqueue: (chunk) => readableController.enqueue(chunk),
+                error: (e) => readableController.error(e),
+                terminate: () => readableController.close()
+            };
+
+            this.writable = new WritableStream({
+                start: transformer.start ? () => transformer.start(transformController) : undefined,
+                write: transformer.transform 
+                    ? async (chunk) => {
+                        await transformer.transform(chunk, transformController);
+                    }
+                    : (chunk) => readableController.enqueue(chunk),
+                close: transformer.flush
+                    ? async () => {
+                        await transformer.flush(transformController);
+                        readableController.close();
+                    }
+                    : () => readableController.close(),
+                abort: (reason) => readableController.error(reason)
+            }, writableStrategy);
+        }
+    }
+
+    // ============================================================================
+    // TextEncoder Implementation (if not already present)
+    // ============================================================================
+    if (typeof globalThis.TextEncoder === 'undefined') {
+        class TextEncoder {
+            get encoding() {
+                return 'utf-8';
+            }
+
+            encode(input = '') {
+                const str = String(input);
+                const len = str.length;
+                let resPos = -1;
+                const resArr = new Uint8Array(len * 3);
+                
+                for (let point = 0, nextcode = 0, i = 0; i !== len;) {
+                    point = str.charCodeAt(i);
+                    i += 1;
+                    
+                    if (point >= 0xD800 && point <= 0xDBFF) {
+                        if (i === len) {
+                            resArr[resPos += 1] = 0xef;
+                            resArr[resPos += 1] = 0xbf;
+                            resArr[resPos += 1] = 0xbd;
+                            break;
+                        }
+                        nextcode = str.charCodeAt(i);
+                        if (nextcode >= 0xDC00 && nextcode <= 0xDFFF) {
+                            point = (point - 0xD800) * 0x400 + nextcode - 0xDC00 + 0x10000;
+                            i += 1;
+                            if (point > 0xffff) {
+                                resArr[resPos += 1] = (0x1e << 3) | (point >>> 18);
+                                resArr[resPos += 1] = (0x2 << 6) | ((point >>> 12) & 0x3f);
+                                resArr[resPos += 1] = (0x2 << 6) | ((point >>> 6) & 0x3f);
+                                resArr[resPos += 1] = (0x2 << 6) | (point & 0x3f);
+                                continue;
+                            }
+                        } else {
+                            resArr[resPos += 1] = 0xef;
+                            resArr[resPos += 1] = 0xbf;
+                            resArr[resPos += 1] = 0xbd;
+                            continue;
+                        }
+                    }
+                    
+                    if (point <= 0x007f) {
+                        resArr[resPos += 1] = (0x0 << 7) | point;
+                    } else if (point <= 0x07ff) {
+                        resArr[resPos += 1] = (0x6 << 5) | (point >>> 6);
+                        resArr[resPos += 1] = (0x2 << 6) | (point & 0x3f);
+                    } else {
+                        resArr[resPos += 1] = (0xe << 4) | (point >>> 12);
+                        resArr[resPos += 1] = (0x2 << 6) | ((point >>> 6) & 0x3f);
+                        resArr[resPos += 1] = (0x2 << 6) | (point & 0x3f);
+                    }
+                }
+                
+                return resArr.subarray(0, resPos + 1);
+            }
+
+            encodeInto(source, destination) {
+                const encoded = this.encode(source);
+                const len = Math.min(encoded.length, destination.length);
+                destination.set(encoded.subarray(0, len));
+                return { read: source.length, written: len };
+            }
+        }
+        globalThis.TextEncoder = TextEncoder;
+    }
+
+    // ============================================================================
+    // ByteLengthQueuingStrategy and CountQueuingStrategy
+    // ============================================================================
+    class ByteLengthQueuingStrategy {
+        #highWaterMark;
+
+        constructor({ highWaterMark }) {
+            this.#highWaterMark = highWaterMark;
+        }
+
+        get highWaterMark() {
+            return this.#highWaterMark;
+        }
+
+        get size() {
+            return (chunk) => chunk.byteLength;
+        }
+    }
+
+    class CountQueuingStrategy {
+        #highWaterMark;
+
+        constructor({ highWaterMark }) {
+            this.#highWaterMark = highWaterMark;
+        }
+
+        get highWaterMark() {
+            return this.#highWaterMark;
+        }
+
+        get size() {
+            return () => 1;
+        }
+    }
+
+    // Export to global
+    globalThis.Blob = Blob;
+    globalThis.ReadableStream = ReadableStream;
+    globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
+    globalThis.WritableStream = WritableStream;
+    globalThis.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
+    globalThis.TransformStream = TransformStream;
+    globalThis.ByteLengthQueuingStrategy = ByteLengthQueuingStrategy;
+    globalThis.CountQueuingStrategy = CountQueuingStrategy;
+
+})(globalThis);
+)JS";
+
+void setup_streams_polyfill(JSContext* ctx) {
+    JSValue result = JS_Eval(ctx, streams_polyfill_source, strlen(streams_polyfill_source),
+                             "<streams-polyfill>", JS_EVAL_TYPE_GLOBAL);
+    
+    if (JS_IsException(result)) {
+        JSValue exc = JS_GetException(ctx);
+        const char* str = JS_ToCString(ctx, exc);
+        if (str) {
+            std::cerr << "Failed to initialize streams polyfill: " << str << std::endl;
+            JS_FreeCString(ctx, str);
+        }
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, result);
+}
+
 }  // namespace quickwork::bindings

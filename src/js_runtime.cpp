@@ -152,6 +152,7 @@ void JsContext::setup_bindings() {
     bindings::setup_text_decoder(ctx_);
     bindings::setup_timers(ctx_);
     bindings::setup_kv_module(ctx_);
+    bindings::setup_streams_polyfill(ctx_);
 }
 
 void JsContext::handle_exception() {
