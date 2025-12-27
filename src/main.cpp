@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "kv_store.hpp"
 #include "server.hpp"
 
 #include <boost/program_options.hpp>
@@ -44,6 +45,8 @@ int main(int argc, char* argv[]) {
             "Max handlers in memory cache (LRU)")
         ("max-storage,S", po::value<size_t>(&config.max_cache_storage_mb)->default_value(0),
             "Max disk storage for bytecode cache in MB (0 = unlimited)")
+        ("kv-size,k", po::value<size_t>(&config.kv_max_entries)->default_value(10 * 1024),
+            "Max entries in shared KV store (LRU eviction)")
     ;
 
     po::variables_map vm;
@@ -79,6 +82,9 @@ int main(int argc, char* argv[]) {
     // Initialize libcurl globally (required for thread safety)
     curl_global_init(CURL_GLOBAL_ALL);
 
+    // Initialize the global KV store
+    quickwork::KvStore::init(config.kv_max_entries);
+
     std::cout << "QuickWork v1.0.0\n";
     std::cout << "===============\n";
     std::cout << "Cache directory: " << config.cache_dir << "\n";
@@ -86,6 +92,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Max storage: " << (config.max_cache_storage_mb == 0 ? "unlimited" : std::to_string(config.max_cache_storage_mb) + " MB") << "\n";
     std::cout << "Max memory: " << config.max_memory_mb << " MB\n";
     std::cout << "Max CPU time: " << config.max_cpu_time_ms << " ms\n";
+    std::cout << "KV store: " << config.kv_max_entries << " max entries\n";
     std::cout << "Threads: " << (config.thread_count == 0 ? std::thread::hardware_concurrency() : config.thread_count) << "\n\n";
 
     try {

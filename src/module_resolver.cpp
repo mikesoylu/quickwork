@@ -591,15 +591,133 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     return bundled.str();
 }
 
+// Check if a specifier is a built-in module
+bool ModuleResolver::is_builtin_module(const std::string& specifier) {
+    return specifier == "quickw";
+}
+
+// Transform built-in module imports to use the global module initializer
+std::string ModuleResolver::transform_builtin_import(const ImportInfo& imp) {
+    std::ostringstream code;
+    
+    if (imp.specifier == "quickw") {
+        // Call the built-in module initializer
+        code << "const __quickw_mod__ = __quickw_kv_module__();\n";
+        
+        if (!imp.default_name.empty()) {
+            code << "const " << imp.default_name << " = __quickw_mod__;\n";
+        }
+        
+        if (!imp.namespace_name.empty()) {
+            code << "const " << imp.namespace_name << " = __quickw_mod__;\n";
+        }
+        
+        for (const auto& named : imp.names) {
+            size_t as_pos = named.find(" as ");
+            if (as_pos != std::string::npos) {
+                std::string orig = named.substr(0, as_pos);
+                std::string alias = named.substr(as_pos + 4);
+                orig.erase(0, orig.find_first_not_of(" \t"));
+                orig.erase(orig.find_last_not_of(" \t") + 1);
+                alias.erase(0, alias.find_first_not_of(" \t"));
+                alias.erase(alias.find_last_not_of(" \t") + 1);
+                code << "const " << alias << " = __quickw_mod__." << orig << ";\n";
+            } else {
+                std::string name = named;
+                name.erase(0, name.find_first_not_of(" \t"));
+                name.erase(name.find_last_not_of(" \t") + 1);
+                if (!name.empty()) {
+                    code << "const " << name << " = __quickw_mod__." << name << ";\n";
+                }
+            }
+        }
+    }
+    
+    return code.str();
+}
+
 std::string ModuleResolver::resolve_and_bundle(std::string_view source) {
     std::string src(source);
     
     // Parse imports from the main source
     auto imports = parse_imports(source);
     
+    // Also parse built-in module imports (they won't be caught by is_remote_url)
+    std::vector<ImportInfo> builtin_imports;
+    
+    // Parse all imports including built-ins
+    std::regex import_default_regex(
+        R"(import\s+(\w+)\s+from\s+["']([^"']+)["'])",
+        std::regex::ECMAScript
+    );
+    std::regex import_named_regex(
+        R"(import\s+\{\s*([^}]+)\s*\}\s+from\s+["']([^"']+)["'])",
+        std::regex::ECMAScript
+    );
+    std::regex import_namespace_regex(
+        R"(import\s+\*\s+as\s+(\w+)\s+from\s+["']([^"']+)["'])",
+        std::regex::ECMAScript
+    );
+    
+    std::sregex_iterator end;
+    
+    // Check for builtin imports - default
+    for (std::sregex_iterator it(src.begin(), src.end(), import_default_regex); it != end; ++it) {
+        const std::smatch& match = *it;
+        std::string specifier = match[2].str();
+        if (is_builtin_module(specifier)) {
+            ImportInfo info;
+            info.full_match = match[0].str();
+            info.default_name = match[1].str();
+            info.specifier = specifier;
+            builtin_imports.push_back(info);
+        }
+    }
+    
+    // Check for builtin imports - named
+    for (std::sregex_iterator it(src.begin(), src.end(), import_named_regex); it != end; ++it) {
+        const std::smatch& match = *it;
+        std::string specifier = match[2].str();
+        if (is_builtin_module(specifier)) {
+            ImportInfo info;
+            info.full_match = match[0].str();
+            info.specifier = specifier;
+            
+            std::string named = match[1].str();
+            std::regex name_regex(R"((\w+)(?:\s+as\s+(\w+))?)");
+            for (std::sregex_iterator name_it(named.begin(), named.end(), name_regex); name_it != end; ++name_it) {
+                info.names.push_back((*name_it)[0].str());
+            }
+            builtin_imports.push_back(info);
+        }
+    }
+    
+    // Check for builtin imports - namespace
+    for (std::sregex_iterator it(src.begin(), src.end(), import_namespace_regex); it != end; ++it) {
+        const std::smatch& match = *it;
+        std::string specifier = match[2].str();
+        if (is_builtin_module(specifier)) {
+            ImportInfo info;
+            info.full_match = match[0].str();
+            info.namespace_name = match[1].str();
+            info.specifier = specifier;
+            builtin_imports.push_back(info);
+        }
+    }
+    
+    // Transform built-in imports first
+    std::string transformed = src;
+    for (const auto& imp : builtin_imports) {
+        size_t pos = transformed.find(imp.full_match);
+        if (pos != std::string::npos) {
+            std::string replacement = transform_builtin_import(imp);
+            transformed.replace(pos, imp.full_match.length(), replacement);
+        }
+    }
+    
     if (imports.empty()) {
-        // No remote imports, return source as-is
-        return src;
+        // No remote imports, return transformed source (may have built-in imports)
+        return transformed;
     }
     
     std::unordered_set<std::string> visited;
@@ -608,7 +726,7 @@ std::string ModuleResolver::resolve_and_bundle(std::string_view source) {
     // Add a header comment
     bundled << "/* Bundled by quickwork module resolver */\n\n";
     
-    // Resolve and bundle each import
+    // Resolve and bundle each remote import
     for (const auto& imp : imports) {
         std::string url = imp.specifier;
         if (url.find("esm.sh/") == 0) {
@@ -621,9 +739,7 @@ std::string ModuleResolver::resolve_and_bundle(std::string_view source) {
         }
     }
     
-    // Transform the main source to use bundled modules
-    std::string transformed = src;
-    
+    // Transform the source to use bundled modules (for remote imports)
     for (const auto& imp : imports) {
         std::string url = imp.specifier;
         if (url.find("esm.sh/") == 0) {

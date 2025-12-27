@@ -49,6 +49,12 @@ private:
     // Check if a specifier is a remote URL (esm.sh, etc)
     [[nodiscard]] static bool is_remote_url(const std::string& specifier);
     
+    // Check if a specifier is a built-in module (quickw, etc)
+    [[nodiscard]] static bool is_builtin_module(const std::string& specifier);
+    
+    // Transform built-in module imports to use the global module initializer
+    [[nodiscard]] static std::string transform_builtin_import(const ImportInfo& imp);
+    
     // Normalize URL (handle relative imports within esm.sh)
     [[nodiscard]] static std::string normalize_url(const std::string& base_url, 
                                                     const std::string& specifier);

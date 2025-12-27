@@ -1,5 +1,6 @@
 #include "js_bindings.hpp"
 #include "js_runtime.hpp"
+#include "kv_store.hpp"
 
 extern "C" {
 #include "quickjs.h"
@@ -1866,6 +1867,235 @@ void cleanup_timers(JSContext* ctx) {
     }
     // Note: The TimerState itself will be freed by js_timer_state_finalizer
     // when the context is freed
+}
+
+// ============================================================================
+// KV Store module - import { kv } from 'quickw'
+// ============================================================================
+
+// kv.get(key) -> string | null
+static JSValue js_kv_get(JSContext* ctx, JSValueConst /*this_val*/,
+                         int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.get requires 1 argument (key)");
+    }
+    
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) {
+        return JS_ThrowTypeError(ctx, "kv.get: key must be a string");
+    }
+    
+    auto result = KvStore::instance().get(key);
+    JS_FreeCString(ctx, key);
+    
+    if (result) {
+        return JS_NewString(ctx, result->c_str());
+    }
+    return JS_NULL;
+}
+
+// kv.set(key, value, ttl?) -> void (throws if key/value too large)
+static JSValue js_kv_set(JSContext* ctx, JSValueConst /*this_val*/,
+                         int argc, JSValueConst* argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "kv.set requires at least 2 arguments (key, value)");
+    }
+    
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) {
+        return JS_ThrowTypeError(ctx, "kv.set: key must be a string");
+    }
+    
+    const char* value = JS_ToCString(ctx, argv[1]);
+    if (!value) {
+        JS_FreeCString(ctx, key);
+        return JS_ThrowTypeError(ctx, "kv.set: value must be a string");
+    }
+    
+    uint64_t ttl_ms = 0;
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        int64_t ttl;
+        if (JS_ToInt64(ctx, &ttl, argv[2])) {
+            JS_FreeCString(ctx, key);
+            JS_FreeCString(ctx, value);
+            return JS_EXCEPTION;
+        }
+        if (ttl > 0) {
+            ttl_ms = static_cast<uint64_t>(ttl);
+        }
+    }
+    
+    bool success = KvStore::instance().set(key, value, ttl_ms);
+    
+    JS_FreeCString(ctx, key);
+    JS_FreeCString(ctx, value);
+    
+    if (!success) {
+        return JS_ThrowRangeError(ctx, "kv.set: key exceeds 128 bytes or value exceeds 1024 bytes");
+    }
+    
+    return JS_UNDEFINED;
+}
+
+// kv.del(key) -> boolean
+static JSValue js_kv_del(JSContext* ctx, JSValueConst /*this_val*/,
+                         int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.del requires 1 argument (key)");
+    }
+    
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) {
+        return JS_ThrowTypeError(ctx, "kv.del: key must be a string");
+    }
+    
+    bool deleted = KvStore::instance().del(key);
+    JS_FreeCString(ctx, key);
+    
+    return JS_NewBool(ctx, deleted);
+}
+
+// kv.exists(key) -> boolean
+static JSValue js_kv_exists(JSContext* ctx, JSValueConst /*this_val*/,
+                            int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.exists requires 1 argument (key)");
+    }
+    
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) {
+        return JS_ThrowTypeError(ctx, "kv.exists: key must be a string");
+    }
+    
+    bool exists = KvStore::instance().exists(key);
+    JS_FreeCString(ctx, key);
+    
+    return JS_NewBool(ctx, exists);
+}
+
+// kv.ttl(key) -> number | null (remaining TTL in ms)
+static JSValue js_kv_ttl(JSContext* ctx, JSValueConst /*this_val*/,
+                         int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.ttl requires 1 argument (key)");
+    }
+    
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) {
+        return JS_ThrowTypeError(ctx, "kv.ttl: key must be a string");
+    }
+    
+    auto result = KvStore::instance().ttl(key);
+    JS_FreeCString(ctx, key);
+    
+    if (result) {
+        return JS_NewInt64(ctx, static_cast<int64_t>(*result));
+    }
+    return JS_NULL;
+}
+
+// kv.scan(prefix, limit?) -> string[]
+static JSValue js_kv_scan(JSContext* ctx, JSValueConst /*this_val*/,
+                          int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.scan requires at least 1 argument (prefix)");
+    }
+    
+    const char* prefix = JS_ToCString(ctx, argv[0]);
+    if (!prefix) {
+        return JS_ThrowTypeError(ctx, "kv.scan: prefix must be a string");
+    }
+    
+    size_t limit = 100;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int64_t limit_val;
+        if (JS_ToInt64(ctx, &limit_val, argv[1]) == 0 && limit_val > 0) {
+            limit = static_cast<size_t>(limit_val);
+        }
+    }
+    
+    auto keys = KvStore::instance().scan(prefix, limit);
+    JS_FreeCString(ctx, prefix);
+    
+    JSValue arr = JS_NewArray(ctx);
+    for (size_t i = 0; i < keys.size(); i++) {
+        JS_SetPropertyUint32(ctx, arr, static_cast<uint32_t>(i), 
+                            JS_NewString(ctx, keys[i].c_str()));
+    }
+    
+    return arr;
+}
+
+// kv.entries(prefix, limit?) -> [key, value][]
+static JSValue js_kv_entries(JSContext* ctx, JSValueConst /*this_val*/,
+                             int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "kv.entries requires at least 1 argument (prefix)");
+    }
+    
+    const char* prefix = JS_ToCString(ctx, argv[0]);
+    if (!prefix) {
+        return JS_ThrowTypeError(ctx, "kv.entries: prefix must be a string");
+    }
+    
+    size_t limit = 100;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int64_t limit_val;
+        if (JS_ToInt64(ctx, &limit_val, argv[1]) == 0 && limit_val > 0) {
+            limit = static_cast<size_t>(limit_val);
+        }
+    }
+    
+    auto pairs = KvStore::instance().scan_pairs(prefix, limit);
+    JS_FreeCString(ctx, prefix);
+    
+    JSValue arr = JS_NewArray(ctx);
+    for (size_t i = 0; i < pairs.size(); i++) {
+        JSValue pair = JS_NewArray(ctx);
+        JS_SetPropertyUint32(ctx, pair, 0, JS_NewString(ctx, pairs[i].first.c_str()));
+        JS_SetPropertyUint32(ctx, pair, 1, JS_NewString(ctx, pairs[i].second.c_str()));
+        JS_SetPropertyUint32(ctx, arr, static_cast<uint32_t>(i), pair);
+    }
+    
+    return arr;
+}
+
+// kv.size() -> number
+static JSValue js_kv_size(JSContext* ctx, JSValueConst /*this_val*/,
+                          int /*argc*/, JSValueConst* /*argv*/) {
+    return JS_NewInt64(ctx, static_cast<int64_t>(KvStore::instance().size()));
+}
+
+// Module initialization function that returns the module namespace object
+static JSValue js_kv_module_init(JSContext* ctx, JSValueConst /*this_val*/,
+                                  int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue exports = JS_NewObject(ctx);
+    
+    // Create kv object
+    JSValue kv = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, kv, "get", JS_NewCFunction(ctx, js_kv_get, "get", 1));
+    JS_SetPropertyStr(ctx, kv, "set", JS_NewCFunction(ctx, js_kv_set, "set", 3));
+    JS_SetPropertyStr(ctx, kv, "del", JS_NewCFunction(ctx, js_kv_del, "del", 1));
+    JS_SetPropertyStr(ctx, kv, "delete", JS_NewCFunction(ctx, js_kv_del, "delete", 1));
+    JS_SetPropertyStr(ctx, kv, "exists", JS_NewCFunction(ctx, js_kv_exists, "exists", 1));
+    JS_SetPropertyStr(ctx, kv, "ttl", JS_NewCFunction(ctx, js_kv_ttl, "ttl", 1));
+    JS_SetPropertyStr(ctx, kv, "scan", JS_NewCFunction(ctx, js_kv_scan, "scan", 2));
+    JS_SetPropertyStr(ctx, kv, "entries", JS_NewCFunction(ctx, js_kv_entries, "entries", 2));
+    JS_SetPropertyStr(ctx, kv, "size", JS_NewCFunction(ctx, js_kv_size, "size", 0));
+    
+    JS_SetPropertyStr(ctx, exports, "kv", kv);
+    
+    return exports;
+}
+
+void setup_kv_module(JSContext* ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    
+    // Register the module initializer - module resolver will use this
+    JS_SetPropertyStr(ctx, global, "__quickw_kv_module__",
+        JS_NewCFunction(ctx, js_kv_module_init, "__quickw_kv_module__", 0));
+    
+    JS_FreeValue(ctx, global);
 }
 
 }  // namespace quickwork::bindings

@@ -25,6 +25,7 @@ void setup_fetch(JSContext* ctx);
 void setup_text_decoder(JSContext* ctx);
 void setup_timers(JSContext* ctx);
 void cleanup_timers(JSContext* ctx);
+void setup_kv_module(JSContext* ctx);
 JSValue create_request(JSContext* ctx, const HttpRequest& request);
 
 // Timer management - called from the event loop
