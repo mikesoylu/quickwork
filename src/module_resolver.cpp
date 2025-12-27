@@ -593,13 +593,23 @@ std::string ModuleResolver::resolve_module(const std::string& url,
         std::string names_str = named_match[1].str();
         std::ostringstream export_assigns;
         
-        std::regex name_regex(R"((\w+)(?:\s+as\s+(\w+))?)");
+        // Match identifiers including $ (common in minified code)
+        // Pattern: identifier (optional: "as" identifier)
+        std::regex name_regex(R"(([\w$]+)\s+as\s+([\w$]+)|([\w$]+))");
         std::sregex_iterator name_it(names_str.begin(), names_str.end(), name_regex);
         std::sregex_iterator name_end;
         
         for (; name_it != name_end; ++name_it) {
-            std::string local_name = (*name_it)[1].str();
-            std::string export_name = (*name_it)[2].matched ? (*name_it)[2].str() : local_name;
+            std::string local_name, export_name;
+            if ((*name_it)[1].matched) {
+                // "X as Y" pattern
+                local_name = (*name_it)[1].str();
+                export_name = (*name_it)[2].str();
+            } else {
+                // Simple "X" pattern
+                local_name = (*name_it)[3].str();
+                export_name = local_name;
+            }
             export_assigns << "__exports." << export_name << " = " << local_name << "; ";
         }
         
@@ -611,7 +621,7 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     }
     
     // Handle "export const/let/var X = ..."
-    std::regex export_decl_regex(R"(export\s+(const|let|var)\s+(\w+)\s*=)");
+    std::regex export_decl_regex(R"(export\s+(const|let|var)\s+([\w$]+)\s*=)");
     temp = with_exports;
     while (std::regex_search(temp, named_match, export_decl_regex)) {
         std::string decl_type = named_match[1].str();
@@ -628,7 +638,7 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     }
     
     // Handle "export function X" and "export class X"
-    std::regex export_func_regex(R"(export\s+(function|class)\s+(\w+))");
+    std::regex export_func_regex(R"(export\s+(function|class)\s+([\w$]+))");
     temp = with_exports;
     while (std::regex_search(temp, named_match, export_func_regex)) {
         std::string type = named_match[1].str();

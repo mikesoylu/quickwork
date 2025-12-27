@@ -1005,6 +1005,96 @@ export default function(req) {
     assert_contains "$response" '"valid":true'
 }
 
+# Test: ESM import Neon serverless postgres client
+test_esm_import_neon() {
+    # Check network connectivity first
+    if ! curl -s --connect-timeout 2 "https://esm.sh" > /dev/null 2>&1; then
+        log_debug "Skipping ESM test - no network connectivity"
+        ((TESTS_SKIPPED++))
+        return 0
+    fi
+    
+    local handler='import { neon } from "https://esm.sh/@neondatabase/serverless";
+
+export default function(req) {
+    // Just verify the import works and neon is a function
+    return Response.json({ 
+        imported: true,
+        isFunction: typeof neon === "function"
+    });
+}'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler "$id")
+    
+    assert_contains "$response" '"imported":true' && \
+    assert_contains "$response" '"isFunction":true'
+}
+
+# Test: ESM import Turso/libsql HTTP client
+test_esm_import_turso() {
+    # Check network connectivity first
+    if ! curl -s --connect-timeout 2 "https://esm.sh" > /dev/null 2>&1; then
+        log_debug "Skipping ESM test - no network connectivity"
+        ((TESTS_SKIPPED++))
+        return 0
+    fi
+    
+    local handler='import { createClient } from "https://esm.sh/@libsql/client/http";
+
+export default function(req) {
+    // Just verify the import works and createClient is a function
+    return Response.json({ 
+        imported: true,
+        isFunction: typeof createClient === "function"
+    });
+}'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler "$id")
+    
+    assert_contains "$response" '"imported":true' && \
+    assert_contains "$response" '"isFunction":true'
+}
+
+# Test: ESM import Supabase JS client
+test_esm_import_supabase() {
+    # Check network connectivity first
+    if ! curl -s --connect-timeout 2 "https://esm.sh" > /dev/null 2>&1; then
+        log_debug "Skipping ESM test - no network connectivity"
+        ((TESTS_SKIPPED++))
+        return 0
+    fi
+    
+    local handler='import { createClient } from "https://esm.sh/@supabase/supabase-js";
+
+export default function(req) {
+    // Just verify the import works and createClient is a function
+    return Response.json({ 
+        imported: true,
+        isFunction: typeof createClient === "function"
+    });
+}'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler "$id")
+    
+    assert_contains "$response" '"imported":true' && \
+    assert_contains "$response" '"isFunction":true'
+}
+
 # Test: Promise.all with fetch (mock endpoint)
 test_promise_all_with_delayed_operations() {
     local handler='export default async function(req) {
@@ -3804,6 +3894,9 @@ main() {
     log_section "ESM Import Tests"
     run_test "ESM default import (ms)" test_esm_import_default
     run_test "ESM named import (uuid)" test_esm_import_named
+    run_test "ESM import Neon serverless" test_esm_import_neon
+    run_test "ESM import Turso/libsql HTTP" test_esm_import_turso
+    run_test "ESM import Supabase JS" test_esm_import_supabase
     
     log_section "Error Handling & Edge Cases"
     run_test "Error handling in handler" test_error_handling

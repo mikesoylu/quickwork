@@ -3493,8 +3493,8 @@ static const char* streams_polyfill_source = R"JS(
     if (typeof globalThis.process === 'undefined') {
         globalThis.process = {
             env: {},
-            version: 'v18.0.0',
-            versions: { node: '18.0.0' },
+            version: 'v22.0.0',
+            versions: { node: '22.0.0' },
             platform: 'quickw',
             arch: 'unknown',
             pid: 1,
