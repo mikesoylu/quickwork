@@ -1116,20 +1116,75 @@ static JSValue js_fetch_response_get_headers(JSContext* ctx, JSValueConst this_v
     auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
     if (!data) return JS_UNDEFINED;
     
-    JSValue headers = JS_NewObject(ctx);
-    for (const auto& [key, value] : data->headers) {
-        JS_SetPropertyStr(ctx, headers, key.c_str(), JS_NewString(ctx, value.c_str()));
+    // Create a Headers instance using the global Headers class
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue headers_ctor = JS_GetPropertyStr(ctx, global, "Headers");
+    JS_FreeValue(ctx, global);
+    
+    if (JS_IsUndefined(headers_ctor)) {
+        // Fallback to plain object if Headers class not available
+        JSValue headers = JS_NewObject(ctx);
+        for (const auto& [key, value] : data->headers) {
+            JS_SetPropertyStr(ctx, headers, key.c_str(), JS_NewString(ctx, value.c_str()));
+        }
+        return headers;
     }
-    return headers;
+    
+    // Create new Headers() instance
+    JSValue headers_obj = JS_CallConstructor(ctx, headers_ctor, 0, nullptr);
+    JS_FreeValue(ctx, headers_ctor);
+    
+    if (JS_IsException(headers_obj)) {
+        return headers_obj;
+    }
+    
+    // Call headers.append(key, value) for each header
+    JSValue append_func = JS_GetPropertyStr(ctx, headers_obj, "append");
+    for (const auto& [key, value] : data->headers) {
+        JSValue args[2] = {
+            JS_NewString(ctx, key.c_str()),
+            JS_NewString(ctx, value.c_str())
+        };
+        JSValue result = JS_Call(ctx, append_func, headers_obj, 2, args);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, args[1]);
+        JS_FreeValue(ctx, result);
+    }
+    JS_FreeValue(ctx, append_func);
+    
+    return headers_obj;
+}
+
+static JSValue js_fetch_response_arraybuffer(JSContext* ctx, JSValueConst this_val,
+                                             int /*argc*/, JSValueConst* /*argv*/) {
+    auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
+    if (!data) return JS_UNDEFINED;
+    
+    // Consume stream if needed
+    consume_stream_body(data);
+    
+    // Create ArrayBuffer from body data
+    size_t len = data->body.size();
+    JSValue arraybuf = JS_NewArrayBufferCopy(ctx, 
+        reinterpret_cast<const uint8_t*>(data->body.data()), len);
+    return arraybuf;
+}
+
+static JSValue js_fetch_response_get_bodyUsed(JSContext* ctx, JSValueConst this_val) {
+    auto* data = static_cast<FetchResponseData*>(JS_GetOpaque(this_val, js_fetch_response_class_id));
+    if (!data) return JS_UNDEFINED;
+    return JS_NewBool(ctx, data->body_consumed);
 }
 
 static const JSCFunctionListEntry js_fetch_response_proto_funcs[] = {
     JS_CGETSET_DEF("status", js_fetch_response_get_status, nullptr),
     JS_CGETSET_DEF("ok", js_fetch_response_get_ok, nullptr),
     JS_CGETSET_DEF("body", js_fetch_response_get_body, nullptr),
+    JS_CGETSET_DEF("bodyUsed", js_fetch_response_get_bodyUsed, nullptr),
     JS_CGETSET_DEF("headers", js_fetch_response_get_headers, nullptr),
     JS_CFUNC_DEF("json", 0, js_fetch_response_json),
     JS_CFUNC_DEF("text", 0, js_fetch_response_text),
+    JS_CFUNC_DEF("arrayBuffer", 0, js_fetch_response_arraybuffer),
 };
 
 namespace {
@@ -1248,19 +1303,120 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst /*this_val*/,
         return JS_ThrowTypeError(ctx, "fetch requires at least 1 argument (url)");
     }
     
-    // Get URL
-    const char* url_str = JS_ToCString(ctx, argv[0]);
-    if (!url_str) {
-        return JS_ThrowTypeError(ctx, "fetch: invalid URL");
-    }
-    std::string url(url_str);
-    JS_FreeCString(ctx, url_str);
-    
-    // Parse options
+    std::string url;
     std::string method = "GET";
     std::string body;
     std::unordered_map<std::string, std::string> headers;
     
+    // Check if first argument is a Request object
+    if (JS_IsObject(argv[0])) {
+        // Check if it has a 'url' property (Request object)
+        JSValue url_prop = JS_GetPropertyStr(ctx, argv[0], "url");
+        if (!JS_IsUndefined(url_prop)) {
+            const char* url_str = JS_ToCString(ctx, url_prop);
+            if (url_str) {
+                url = url_str;
+                JS_FreeCString(ctx, url_str);
+            }
+            JS_FreeValue(ctx, url_prop);
+            
+            // Get method from Request
+            JSValue method_prop = JS_GetPropertyStr(ctx, argv[0], "method");
+            if (!JS_IsUndefined(method_prop)) {
+                const char* method_str = JS_ToCString(ctx, method_prop);
+                if (method_str) {
+                    method = method_str;
+                    JS_FreeCString(ctx, method_str);
+                }
+            }
+            JS_FreeValue(ctx, method_prop);
+            
+            // Get headers from Request
+            JSValue headers_prop = JS_GetPropertyStr(ctx, argv[0], "headers");
+            if (JS_IsObject(headers_prop)) {
+                // Call forEach on Headers object to extract headers
+                JSValue forEach = JS_GetPropertyStr(ctx, headers_prop, "forEach");
+                if (JS_IsFunction(ctx, forEach)) {
+                    // Create a callback that collects headers
+                    // For simplicity, try to get common headers or iterate
+                    JSValue entries = JS_GetPropertyStr(ctx, headers_prop, "entries");
+                    if (JS_IsFunction(ctx, entries)) {
+                        JSValue iter = JS_Call(ctx, entries, headers_prop, 0, nullptr);
+                        if (!JS_IsException(iter)) {
+                            JSValue next_fn = JS_GetPropertyStr(ctx, iter, "next");
+                            if (JS_IsFunction(ctx, next_fn)) {
+                                while (true) {
+                                    JSValue result = JS_Call(ctx, next_fn, iter, 0, nullptr);
+                                    if (JS_IsException(result)) break;
+                                    
+                                    JSValue done = JS_GetPropertyStr(ctx, result, "done");
+                                    bool is_done = JS_ToBool(ctx, done);
+                                    JS_FreeValue(ctx, done);
+                                    
+                                    if (is_done) {
+                                        JS_FreeValue(ctx, result);
+                                        break;
+                                    }
+                                    
+                                    JSValue value = JS_GetPropertyStr(ctx, result, "value");
+                                    if (JS_IsArray(ctx, value)) {
+                                        JSValue key_val = JS_GetPropertyUint32(ctx, value, 0);
+                                        JSValue val_val = JS_GetPropertyUint32(ctx, value, 1);
+                                        const char* key = JS_ToCString(ctx, key_val);
+                                        const char* val = JS_ToCString(ctx, val_val);
+                                        if (key && val) {
+                                            headers[key] = val;
+                                        }
+                                        if (key) JS_FreeCString(ctx, key);
+                                        if (val) JS_FreeCString(ctx, val);
+                                        JS_FreeValue(ctx, key_val);
+                                        JS_FreeValue(ctx, val_val);
+                                    }
+                                    JS_FreeValue(ctx, value);
+                                    JS_FreeValue(ctx, result);
+                                }
+                            }
+                            JS_FreeValue(ctx, next_fn);
+                            JS_FreeValue(ctx, iter);
+                        }
+                        JS_FreeValue(ctx, entries);
+                    }
+                }
+                JS_FreeValue(ctx, forEach);
+            }
+            JS_FreeValue(ctx, headers_prop);
+            
+            // Get body from Request
+            JSValue body_prop = JS_GetPropertyStr(ctx, argv[0], "body");
+            if (!JS_IsUndefined(body_prop) && !JS_IsNull(body_prop)) {
+                const char* body_str = JS_ToCString(ctx, body_prop);
+                if (body_str) {
+                    body = body_str;
+                    JS_FreeCString(ctx, body_str);
+                }
+            }
+            JS_FreeValue(ctx, body_prop);
+        } else {
+            JS_FreeValue(ctx, url_prop);
+            // Not a Request object, treat as URL string
+            const char* url_str = JS_ToCString(ctx, argv[0]);
+            if (!url_str) {
+                return JS_ThrowTypeError(ctx, "fetch: invalid URL");
+            }
+            url = url_str;
+            JS_FreeCString(ctx, url_str);
+        }
+    } else {
+        // Simple string URL
+        const char* url_str = JS_ToCString(ctx, argv[0]);
+        if (!url_str) {
+            return JS_ThrowTypeError(ctx, "fetch: invalid URL");
+        }
+        url = url_str;
+        JS_FreeCString(ctx, url_str);
+    }
+    
+    // Parse options (second argument overrides Request properties)
     if (argc >= 2 && JS_IsObject(argv[1])) {
         JSValue options = argv[1];
         
@@ -3097,8 +3253,535 @@ static const char* streams_polyfill_source = R"JS(
         }
     }
 
+    // ============================================================================
+    // Node.js Polyfills (Buffer, process) for compatibility with npm packages
+    // ============================================================================
+    
+    // Minimal Buffer implementation
+    if (typeof globalThis.Buffer === 'undefined') {
+        class Buffer extends Uint8Array {
+            static isBuffer(obj) {
+                return obj instanceof Buffer;
+            }
+            
+            static from(value, encodingOrOffset, length) {
+                if (typeof value === 'string') {
+                    const encoding = encodingOrOffset || 'utf-8';
+                    if (encoding === 'base64') {
+                        const binary = atob(value);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
+                        }
+                        return new Buffer(bytes);
+                    } else if (encoding === 'hex') {
+                        const bytes = new Uint8Array(value.length / 2);
+                        for (let i = 0; i < value.length; i += 2) {
+                            bytes[i / 2] = parseInt(value.substr(i, 2), 16);
+                        }
+                        return new Buffer(bytes);
+                    } else {
+                        // utf-8
+                        const encoder = new TextEncoder();
+                        return new Buffer(encoder.encode(value));
+                    }
+                } else if (value instanceof ArrayBuffer) {
+                    return new Buffer(new Uint8Array(value, encodingOrOffset, length));
+                } else if (ArrayBuffer.isView(value)) {
+                    return new Buffer(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+                } else if (Array.isArray(value)) {
+                    return new Buffer(value);
+                }
+                return new Buffer(value);
+            }
+            
+            static alloc(size, fill = 0, encoding) {
+                const buf = new Buffer(size);
+                if (fill !== 0) {
+                    buf.fill(fill);
+                }
+                return buf;
+            }
+            
+            static allocUnsafe(size) {
+                return new Buffer(size);
+            }
+            
+            static concat(list, totalLength) {
+                if (totalLength === undefined) {
+                    totalLength = list.reduce((acc, buf) => acc + buf.length, 0);
+                }
+                const result = new Buffer(totalLength);
+                let offset = 0;
+                for (const buf of list) {
+                    result.set(buf, offset);
+                    offset += buf.length;
+                }
+                return result;
+            }
+            
+            static byteLength(string, encoding = 'utf-8') {
+                if (typeof string !== 'string') {
+                    return string.byteLength || string.length;
+                }
+                return Buffer.from(string, encoding).length;
+            }
+            
+            toString(encoding = 'utf-8', start = 0, end = this.length) {
+                const slice = this.subarray(start, end);
+                if (encoding === 'base64') {
+                    let binary = '';
+                    for (let i = 0; i < slice.length; i++) {
+                        binary += String.fromCharCode(slice[i]);
+                    }
+                    return btoa(binary);
+                } else if (encoding === 'hex') {
+                    return Array.from(slice)
+                        .map(b => b.toString(16).padStart(2, '0'))
+                        .join('');
+                } else {
+                    // utf-8
+                    const decoder = new TextDecoder(encoding);
+                    return decoder.decode(slice);
+                }
+            }
+            
+            write(string, offset = 0, length, encoding = 'utf-8') {
+                const buf = Buffer.from(string, encoding);
+                const bytesToWrite = Math.min(buf.length, length || buf.length, this.length - offset);
+                this.set(buf.subarray(0, bytesToWrite), offset);
+                return bytesToWrite;
+            }
+            
+            copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
+                const slice = this.subarray(sourceStart, sourceEnd);
+                target.set(slice, targetStart);
+                return slice.length;
+            }
+            
+            slice(start, end) {
+                return new Buffer(this.subarray(start, end));
+            }
+            
+            readUInt8(offset) {
+                return this[offset];
+            }
+            
+            readUInt16BE(offset) {
+                return (this[offset] << 8) | this[offset + 1];
+            }
+            
+            readUInt16LE(offset) {
+                return this[offset] | (this[offset + 1] << 8);
+            }
+            
+            readUInt32BE(offset) {
+                return (this[offset] * 0x1000000) + ((this[offset + 1] << 16) | (this[offset + 2] << 8) | this[offset + 3]);
+            }
+            
+            readUInt32LE(offset) {
+                return ((this[offset + 3] * 0x1000000) + ((this[offset + 2] << 16) | (this[offset + 1] << 8) | this[offset]));
+            }
+            
+            readInt8(offset) {
+                const val = this[offset];
+                return val > 127 ? val - 256 : val;
+            }
+            
+            readInt16BE(offset) {
+                const val = this.readUInt16BE(offset);
+                return val > 32767 ? val - 65536 : val;
+            }
+            
+            readInt16LE(offset) {
+                const val = this.readUInt16LE(offset);
+                return val > 32767 ? val - 65536 : val;
+            }
+            
+            readInt32BE(offset) {
+                return (this[offset] << 24) | (this[offset + 1] << 16) | (this[offset + 2] << 8) | this[offset + 3];
+            }
+            
+            readInt32LE(offset) {
+                return (this[offset + 3] << 24) | (this[offset + 2] << 16) | (this[offset + 1] << 8) | this[offset];
+            }
+            
+            writeUInt8(value, offset) {
+                this[offset] = value & 0xff;
+                return offset + 1;
+            }
+            
+            writeUInt16BE(value, offset) {
+                this[offset] = (value >>> 8) & 0xff;
+                this[offset + 1] = value & 0xff;
+                return offset + 2;
+            }
+            
+            writeUInt16LE(value, offset) {
+                this[offset] = value & 0xff;
+                this[offset + 1] = (value >>> 8) & 0xff;
+                return offset + 2;
+            }
+            
+            writeUInt32BE(value, offset) {
+                this[offset] = (value >>> 24) & 0xff;
+                this[offset + 1] = (value >>> 16) & 0xff;
+                this[offset + 2] = (value >>> 8) & 0xff;
+                this[offset + 3] = value & 0xff;
+                return offset + 4;
+            }
+            
+            writeUInt32LE(value, offset) {
+                this[offset] = value & 0xff;
+                this[offset + 1] = (value >>> 8) & 0xff;
+                this[offset + 2] = (value >>> 16) & 0xff;
+                this[offset + 3] = (value >>> 24) & 0xff;
+                return offset + 4;
+            }
+            
+            writeInt8(value, offset) {
+                if (value < 0) value = 256 + value;
+                return this.writeUInt8(value, offset);
+            }
+            
+            writeInt16BE(value, offset) {
+                if (value < 0) value = 65536 + value;
+                return this.writeUInt16BE(value, offset);
+            }
+            
+            writeInt16LE(value, offset) {
+                if (value < 0) value = 65536 + value;
+                return this.writeUInt16LE(value, offset);
+            }
+            
+            writeInt32BE(value, offset) {
+                return this.writeUInt32BE(value >>> 0, offset);
+            }
+            
+            writeInt32LE(value, offset) {
+                return this.writeUInt32LE(value >>> 0, offset);
+            }
+            
+            equals(other) {
+                if (this.length !== other.length) return false;
+                for (let i = 0; i < this.length; i++) {
+                    if (this[i] !== other[i]) return false;
+                }
+                return true;
+            }
+            
+            compare(other) {
+                const len = Math.min(this.length, other.length);
+                for (let i = 0; i < len; i++) {
+                    if (this[i] < other[i]) return -1;
+                    if (this[i] > other[i]) return 1;
+                }
+                if (this.length < other.length) return -1;
+                if (this.length > other.length) return 1;
+                return 0;
+            }
+            
+            toJSON() {
+                return { type: 'Buffer', data: Array.from(this) };
+            }
+        }
+        
+        globalThis.Buffer = Buffer;
+    }
+    
+    // Minimal process polyfill
+    if (typeof globalThis.process === 'undefined') {
+        globalThis.process = {
+            env: {},
+            version: 'v18.0.0',
+            versions: { node: '18.0.0' },
+            platform: 'quickw',
+            arch: 'unknown',
+            pid: 1,
+            cwd: () => '/',
+            chdir: () => {},
+            nextTick: (fn, ...args) => queueMicrotask ? queueMicrotask(() => fn(...args)) : setTimeout(() => fn(...args), 0),
+            hrtime: {
+                bigint: () => BigInt(Date.now()) * 1000000n
+            },
+            stdout: { write: (s) => console.log(s) },
+            stderr: { write: (s) => console.error(s) },
+            exit: () => {},
+            on: () => {},
+            off: () => {},
+            emit: () => {},
+            binding: () => ({}),
+            umask: () => 0
+        };
+    }
+    
+    // queueMicrotask polyfill
+    if (typeof globalThis.queueMicrotask === 'undefined') {
+        globalThis.queueMicrotask = (fn) => Promise.resolve().then(fn);
+    }
+
+    // ============================================================================
+    // Headers class (for fetch API compatibility)
+    // ============================================================================
+    class Headers {
+        #headers = new Map();
+
+        constructor(init) {
+            if (init instanceof Headers) {
+                init.forEach((value, name) => this.append(name, value));
+            } else if (Array.isArray(init)) {
+                for (const [name, value] of init) {
+                    this.append(name, value);
+                }
+            } else if (init && typeof init === 'object') {
+                for (const [name, value] of Object.entries(init)) {
+                    this.append(name, value);
+                }
+            }
+        }
+
+        append(name, value) {
+            name = String(name).toLowerCase();
+            value = String(value);
+            const existing = this.#headers.get(name);
+            if (existing !== undefined) {
+                this.#headers.set(name, existing + ', ' + value);
+            } else {
+                this.#headers.set(name, value);
+            }
+        }
+
+        delete(name) {
+            this.#headers.delete(String(name).toLowerCase());
+        }
+
+        get(name) {
+            return this.#headers.get(String(name).toLowerCase()) || null;
+        }
+
+        has(name) {
+            return this.#headers.has(String(name).toLowerCase());
+        }
+
+        set(name, value) {
+            this.#headers.set(String(name).toLowerCase(), String(value));
+        }
+
+        forEach(callback, thisArg) {
+            for (const [name, value] of this.#headers) {
+                callback.call(thisArg, value, name, this);
+            }
+        }
+
+        *entries() { yield* this.#headers.entries(); }
+        *keys() { yield* this.#headers.keys(); }
+        *values() { yield* this.#headers.values(); }
+        [Symbol.iterator]() { return this.entries(); }
+    }
+
+    // ============================================================================
+    // Request class (for fetch API compatibility)
+    // ============================================================================
+    class Request {
+        #url;
+        #method;
+        #headers;
+        #body;
+        #bodyUsed = false;
+
+        constructor(input, init = {}) {
+            if (input instanceof Request) {
+                this.#url = input.url;
+                this.#method = init.method || input.method;
+                this.#headers = new Headers(init.headers || input.headers);
+                this.#body = init.body !== undefined ? init.body : input.#body;
+            } else {
+                this.#url = String(input);
+                this.#method = init.method || 'GET';
+                this.#headers = new Headers(init.headers);
+                this.#body = init.body;
+            }
+        }
+
+        get url() { return this.#url; }
+        get method() { return this.#method.toUpperCase(); }
+        get headers() { return this.#headers; }
+        get body() { return this.#body; }
+        get bodyUsed() { return this.#bodyUsed; }
+
+        async text() {
+            if (this.#bodyUsed) throw new TypeError('Body already used');
+            this.#bodyUsed = true;
+            if (this.#body === null || this.#body === undefined) return '';
+            if (typeof this.#body === 'string') return this.#body;
+            if (this.#body instanceof ArrayBuffer) return new TextDecoder().decode(this.#body);
+            if (ArrayBuffer.isView(this.#body)) return new TextDecoder().decode(this.#body);
+            return String(this.#body);
+        }
+
+        async json() {
+            return JSON.parse(await this.text());
+        }
+
+        async arrayBuffer() {
+            if (this.#bodyUsed) throw new TypeError('Body already used');
+            this.#bodyUsed = true;
+            if (this.#body === null || this.#body === undefined) return new ArrayBuffer(0);
+            if (this.#body instanceof ArrayBuffer) return this.#body;
+            if (ArrayBuffer.isView(this.#body)) return this.#body.buffer.slice(this.#body.byteOffset, this.#body.byteOffset + this.#body.byteLength);
+            const encoder = new TextEncoder();
+            return encoder.encode(String(this.#body)).buffer;
+        }
+
+        clone() {
+            if (this.#bodyUsed) throw new TypeError('Body already used');
+            return new Request(this.#url, {
+                method: this.#method,
+                headers: this.#headers,
+                body: this.#body
+            });
+        }
+    }
+
+    // ============================================================================
+    // Event / EventTarget polyfill
+    // ============================================================================
+    class Event {
+        constructor(type, options = {}) {
+            this.type = type;
+            this.bubbles = !!options.bubbles;
+            this.cancelable = !!options.cancelable;
+            this.defaultPrevented = false;
+            this.target = null;
+            this.currentTarget = null;
+            this.timeStamp = Date.now();
+        }
+        preventDefault() { 
+            if (this.cancelable) this.defaultPrevented = true; 
+        }
+        stopPropagation() {}
+        stopImmediatePropagation() {}
+    }
+
+    class EventTarget {
+        #listeners = new Map();
+
+        addEventListener(type, callback, options) {
+            if (!this.#listeners.has(type)) {
+                this.#listeners.set(type, []);
+            }
+            this.#listeners.get(type).push({ callback, options });
+        }
+
+        removeEventListener(type, callback) {
+            if (!this.#listeners.has(type)) return;
+            const arr = this.#listeners.get(type);
+            const idx = arr.findIndex(l => l.callback === callback);
+            if (idx !== -1) arr.splice(idx, 1);
+        }
+
+        dispatchEvent(event) {
+            event.target = this;
+            event.currentTarget = this;
+            const listeners = this.#listeners.get(event.type) || [];
+            for (const { callback } of listeners) {
+                if (typeof callback === 'function') {
+                    callback.call(this, event);
+                } else if (callback && typeof callback.handleEvent === 'function') {
+                    callback.handleEvent(event);
+                }
+            }
+            return !event.defaultPrevented;
+        }
+    }
+
+    // Simple DOMException if not available
+    if (typeof globalThis.DOMException === 'undefined') {
+        class DOMException extends Error {
+            constructor(message, name) {
+                super(message);
+                this.name = name || 'DOMException';
+            }
+        }
+        globalThis.DOMException = DOMException;
+    }
+
+    // ============================================================================
+    // AbortController / AbortSignal polyfill
+    // Used by fetch-based libraries for request cancellation/timeouts
+    // ============================================================================
+    class AbortSignal extends EventTarget {
+        #aborted = false;
+        #reason = undefined;
+
+        get aborted() { return this.#aborted; }
+        get reason() { return this.#reason; }
+
+        static abort(reason) {
+            const signal = new AbortSignal();
+            signal.#aborted = true;
+            signal.#reason = reason !== undefined ? reason : new DOMException('signal is aborted without reason', 'AbortError');
+            return signal;
+        }
+
+        static timeout(ms) {
+            const controller = new AbortController();
+            setTimeout(() => {
+                controller.abort(new DOMException('signal timed out', 'TimeoutError'));
+            }, ms);
+            return controller.signal;
+        }
+
+        throwIfAborted() {
+            if (this.#aborted) {
+                throw this.#reason;
+            }
+        }
+
+        // Internal: called by AbortController
+        _abort(reason) {
+            if (this.#aborted) return;
+            this.#aborted = true;
+            this.#reason = reason !== undefined ? reason : new DOMException('signal is aborted without reason', 'AbortError');
+            this.dispatchEvent(new Event('abort'));
+        }
+    }
+
+    class AbortController {
+        #signal = new AbortSignal();
+
+        get signal() { return this.#signal; }
+
+        abort(reason) {
+            this.#signal._abort(reason);
+        }
+    }
+
+    // ============================================================================
+    // WebSocket stub (prevents errors from libraries that import isomorphic-ws)
+    // The @libsql/client HTTP transport doesn't actually use WebSocket, but the
+    // bundled code includes WebSocket references that fail if undefined
+    // ============================================================================
+    class WebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        constructor(url, protocols) {
+            throw new Error('WebSocket is not supported in this runtime. Use HTTP transport instead.');
+        }
+    }
+
     // Export to global
+    globalThis.Event = Event;
+    globalThis.EventTarget = EventTarget;
     globalThis.Blob = Blob;
+    globalThis.Headers = Headers;
+    globalThis.Request = Request;
+    globalThis.WebSocket = WebSocket;
+    globalThis.AbortController = AbortController;
+    globalThis.AbortSignal = AbortSignal;
     globalThis.ReadableStream = ReadableStream;
     globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
     globalThis.WritableStream = WritableStream;

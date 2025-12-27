@@ -49,6 +49,9 @@ private:
     // Check if a specifier is a remote URL (esm.sh, etc)
     [[nodiscard]] static bool is_remote_url(const std::string& specifier);
     
+    // Check if this is a Node.js polyfill path that we provide ourselves
+    [[nodiscard]] static bool is_node_polyfill(const std::string& specifier);
+    
     // Check if a specifier is a built-in module (quickw, etc)
     [[nodiscard]] static bool is_builtin_module(const std::string& specifier);
     

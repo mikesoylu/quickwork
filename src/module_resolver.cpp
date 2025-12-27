@@ -41,6 +41,16 @@ bool ModuleResolver::is_remote_url(const std::string& specifier) {
            specifier.find("esm.sh/") == 0;
 }
 
+// Check if this is a Node.js polyfill path that we should skip
+// (we provide our own Buffer and process polyfills)
+bool ModuleResolver::is_node_polyfill(const std::string& specifier) {
+    // Skip esm.sh node polyfill imports - we have our own
+    if (specifier.find("/node/") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
 std::string ModuleResolver::normalize_url(const std::string& base_url, 
                                            const std::string& specifier) {
     // Handle esm.sh shorthand
@@ -128,8 +138,10 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
     std::sregex_iterator end;
     
     // Pattern 1: import defaultExport from "module"
+    // Note: Allow $ in identifiers (used by esm.sh bundled code like __Process$)
+    // Use \s* to handle minified code like 'import R from"module"'
     std::regex import_default_regex(
-        R"(import\s+(\w+)\s+from\s+["']([^"']+)["'])",
+        R"(import\s+([\w$]+)\s+from\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -145,14 +157,16 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier)) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
     
     // Pattern 2: import { a, b as c } from "module"
+    // Use \s* to handle minified code
     std::regex import_named_regex(
-        R"(import\s+\{\s*([^}]+)\s*\}\s+from\s+["']([^"']+)["'])",
+        R"(import\s*\{\s*([^}]+)\s*\}\s*from\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -162,9 +176,9 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
         info.full_match = match[0].str();
         info.specifier = match[2].str();
         
-        // Parse named imports
+        // Parse named imports (allow $ in identifiers)
         std::string named = match[1].str();
-        std::regex name_regex(R"((\w+)(?:\s+as\s+(\w+))?)");
+        std::regex name_regex(R"(([\w$]+)(?:\s+as\s+([\w$]+))?)");
         for (std::sregex_iterator name_it(named.begin(), named.end(), name_regex); name_it != end; ++name_it) {
             info.names.push_back((*name_it)[0].str());
         }
@@ -174,14 +188,16 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier)) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
     
-    // Pattern 3: import * as name from "module"
+    // Pattern 3: import * as name from "module" (allow $ in identifiers)
+    // Note: \s* instead of \s+ to handle minified code like "import*as n from..."
     std::regex import_namespace_regex(
-        R"(import\s+\*\s+as\s+(\w+)\s+from\s+["']([^"']+)["'])",
+        R"(import\s*\*\s*as\s+([\w$]+)\s+from\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -197,14 +213,16 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier)) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
     
     // Pattern 4: import "module" (side-effect only)
+    // Use \s* to handle minified code
     std::regex import_side_effect_regex(
-        R"(import\s+["']([^"']+)["'])",
+        R"(import\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -231,14 +249,16 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier)) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
     
     // Pattern 5: export * from "module"
+    // Use \s* to handle minified code
     std::regex export_star_regex(
-        R"(export\s+\*\s+from\s+["']([^"']+)["'])",
+        R"(export\s*\*\s*from\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -254,15 +274,16 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier) || 
-            (!base_url.empty() && !info.specifier.empty() && info.specifier[0] == '/')) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
     
     // Pattern 6: export { a, b } from "module"
+    // Use \s* to handle minified code
     std::regex export_named_regex(
-        R"(export\s+\{\s*([^}]+)\s*\}\s+from\s+["']([^"']+)["'])",
+        R"(export\s*\{\s*([^}]+)\s*\}\s*from\s*["']([^"']+)["'])",
         std::regex::ECMAScript
     );
     
@@ -273,9 +294,9 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
         info.specifier = match[2].str();
         info.is_export_from = true;
         
-        // Parse named exports
+        // Parse named exports (allow $ in identifiers)
         std::string named = match[1].str();
-        std::regex name_regex(R"((\w+)(?:\s+as\s+(\w+))?)");
+        std::regex name_regex(R"(([\w$]+)(?:\s+as\s+([\w$]+))?)");
         for (std::sregex_iterator name_it(named.begin(), named.end(), name_regex); name_it != end; ++name_it) {
             info.names.push_back((*name_it)[0].str());
         }
@@ -285,8 +306,8 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier) || 
-            (!base_url.empty() && !info.specifier.empty() && info.specifier[0] == '/')) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
@@ -306,7 +327,8 @@ std::vector<ImportInfo> ModuleResolver::parse_imports_with_base(std::string_view
             info.specifier = normalize_url(base_url, info.specifier);
         }
         
-        if (is_remote_url(info.specifier)) {
+        // Include remote URLs and Node polyfills (which we'll handle specially)
+        if (is_remote_url(info.specifier) || is_node_polyfill(info.specifier)) {
             imports.push_back(info);
         }
     }
@@ -400,6 +422,12 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     // First, recursively resolve all dependencies
     for (const auto& imp : imports) {
         std::string dep_url = normalize_url(normalized_url, imp.specifier);
+        
+        // Skip Node.js polyfills - we provide our own Buffer and process
+        if (is_node_polyfill(dep_url)) {
+            continue;
+        }
+        
         std::string dep_source = resolve_module(dep_url, visited);
         if (!dep_source.empty()) {
             bundled << dep_source << "\n";
@@ -411,6 +439,51 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     
     for (const auto& imp : imports) {
         std::string dep_url = imp.specifier;  // Already normalized by parse_imports_with_base
+        
+        // For Node.js polyfills, just remove the import statement
+        // Our runtime provides Buffer and process globally
+        if (is_node_polyfill(dep_url)) {
+            size_t pos = transformed.find(imp.full_match);
+            if (pos != std::string::npos) {
+                std::ostringstream comment;
+                comment << "/* Node polyfill " << dep_url << " provided by runtime */\n";
+                
+                // If it's importing specific things, map them to our globals
+                if (!imp.default_name.empty()) {
+                    if (dep_url.find("buffer") != std::string::npos) {
+                        comment << "const " << imp.default_name << " = globalThis.Buffer;\n";
+                    } else if (dep_url.find("process") != std::string::npos) {
+                        comment << "const " << imp.default_name << " = globalThis.process;\n";
+                    }
+                }
+                
+                for (const auto& named : imp.names) {
+                    std::string name = named;
+                    size_t as_pos = name.find(" as ");
+                    std::string local_name = name;
+                    std::string import_name = name;
+                    if (as_pos != std::string::npos) {
+                        import_name = name.substr(0, as_pos);
+                        local_name = name.substr(as_pos + 4);
+                    }
+                    // Trim
+                    import_name.erase(0, import_name.find_first_not_of(" \t"));
+                    import_name.erase(import_name.find_last_not_of(" \t") + 1);
+                    local_name.erase(0, local_name.find_first_not_of(" \t"));
+                    local_name.erase(local_name.find_last_not_of(" \t") + 1);
+                    
+                    if (dep_url.find("buffer") != std::string::npos && import_name == "Buffer") {
+                        comment << "const " << local_name << " = globalThis.Buffer;\n";
+                    } else if (dep_url.find("process") != std::string::npos) {
+                        comment << "const " << local_name << " = globalThis.process;\n";
+                    }
+                }
+                
+                transformed.replace(pos, imp.full_match.length(), comment.str());
+            }
+            continue;
+        }
+        
         std::string var_name = url_to_var_name(dep_url);
         
         if (imp.is_dynamic) {
