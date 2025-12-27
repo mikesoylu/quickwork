@@ -152,7 +152,8 @@ void JsContext::setup_bindings() {
     bindings::setup_text_decoder(ctx_);
     bindings::setup_timers(ctx_);
     bindings::setup_kv_module(ctx_);
-    bindings::setup_streams_polyfill(ctx_);
+    // Note: streams polyfill is now included at bytecode compilation time
+    // for better runtime performance (no JS parsing needed)
 }
 
 void JsContext::handle_exception() {

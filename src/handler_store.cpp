@@ -1,4 +1,5 @@
 #include "handler_store.hpp"
+#include "js_bindings.hpp"
 #include "module_resolver.hpp"
 
 #include <algorithm>
@@ -208,8 +209,13 @@ Bytecode HandlerStore::compile_to_bytecode(::JSRuntime* rt, std::string_view sou
         }
     }
 
-    // Prepend variable declaration
-    std::string setup_code = "var __handler__;\n" + transformed;
+    // Build final source code with polyfills included at compile time
+    // This avoids parsing the polyfill JS at runtime - it's compiled into bytecode
+    std::string setup_code;
+    setup_code.reserve(strlen(bindings::get_streams_polyfill_source()) + transformed.size() + 100);
+    setup_code += bindings::get_streams_polyfill_source();
+    setup_code += "\nvar __handler__;\n";
+    setup_code += transformed;
 
     // Compile to bytecode (JS_EVAL_FLAG_COMPILE_ONLY returns function object without executing)
     JSValue obj = JS_Eval(ctx, setup_code.c_str(), setup_code.size(),

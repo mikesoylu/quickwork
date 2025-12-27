@@ -4105,20 +4105,9 @@ static const char* streams_polyfill_source = R"JS(
 })(globalThis);
 )JS";
 
-void setup_streams_polyfill(JSContext* ctx) {
-    JSValue result = JS_Eval(ctx, streams_polyfill_source, strlen(streams_polyfill_source),
-                             "<streams-polyfill>", JS_EVAL_TYPE_GLOBAL);
-    
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(ctx);
-        const char* str = JS_ToCString(ctx, exc);
-        if (str) {
-            std::cerr << "Failed to initialize streams polyfill: " << str << std::endl;
-            JS_FreeCString(ctx, str);
-        }
-        JS_FreeValue(ctx, exc);
-    }
-    JS_FreeValue(ctx, result);
+// Returns the streams polyfill source code for compile-time inclusion
+const char* get_streams_polyfill_source() {
+    return streams_polyfill_source;
 }
 
 }  // namespace quickwork::bindings
