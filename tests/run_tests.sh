@@ -3893,7 +3893,7 @@ main() {
     
     # Start server
     log "Starting server on port $PORT..."
-    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 --max-memory 1 &
+    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 --max-memory 4 &
     SERVER_PID=$!
     
     if ! wait_for_server; then

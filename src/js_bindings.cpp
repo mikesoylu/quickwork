@@ -2260,6 +2260,72 @@ void setup_kv_module(JSContext* ctx) {
 
 static const char* streams_polyfill_source = R"JS(
 // ============================================================================
+// MessageChannel Polyfill (needed by React DOM)
+// ============================================================================
+(function(globalThis) {
+    'use strict';
+    
+    if (typeof globalThis.MessageChannel === 'undefined') {
+        class MessagePort {
+            constructor() {
+                this.onmessage = null;
+                this._otherPort = null;
+            }
+            
+            postMessage(data) {
+                if (this._otherPort && this._otherPort.onmessage) {
+                    const port = this._otherPort;
+                    setTimeout(() => {
+                        if (port.onmessage) {
+                            port.onmessage({ data: data, ports: [] });
+                        }
+                    }, 0);
+                }
+            }
+            
+            close() {
+                this.onmessage = null;
+            }
+            
+            start() {}
+            
+            addEventListener(type, listener) {
+                if (type === 'message') {
+                    this.onmessage = listener;
+                }
+            }
+            
+            removeEventListener(type, listener) {
+                if (type === 'message' && this.onmessage === listener) {
+                    this.onmessage = null;
+                }
+            }
+        }
+        
+        class MessageChannel {
+            constructor() {
+                this.port1 = new MessagePort();
+                this.port2 = new MessagePort();
+                this.port1._otherPort = this.port2;
+                this.port2._otherPort = this.port1;
+            }
+        }
+        
+        globalThis.MessageChannel = MessageChannel;
+        globalThis.MessagePort = MessagePort;
+    }
+    
+    if (typeof globalThis.setImmediate === 'undefined') {
+        globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 0, ...args);
+        globalThis.clearImmediate = (id) => clearTimeout(id);
+    }
+    
+    if (typeof globalThis.queueMicrotask === 'undefined') {
+        globalThis.queueMicrotask = (fn) => Promise.resolve().then(fn);
+    }
+})(globalThis);
+
+// ============================================================================
 // Blob Implementation
 // ============================================================================
 (function(globalThis) {
