@@ -660,18 +660,6 @@ bool ModuleResolver::is_builtin_module(const std::string& specifier) {
     return specifier == "quickw";
 }
 
-// Get polyfill imports to prepend to user code
-std::string ModuleResolver::get_polyfill_imports() {
-    // Import polyfills from esm.sh for APIs not natively available in QuickJS
-    // These are side-effect imports that patch the global object
-    return R"(
-import "https://esm.sh/core-js/actual/url";
-import "https://esm.sh/core-js/actual/url-search-params";
-import "https://esm.sh/core-js/actual/atob";
-import "https://esm.sh/core-js/actual/btoa";
-)";}
-
-
 // Transform built-in module imports to use the global module initializer
 std::string ModuleResolver::transform_builtin_import(const ImportInfo& imp) {
     std::ostringstream code;
@@ -713,10 +701,9 @@ std::string ModuleResolver::transform_builtin_import(const ImportInfo& imp) {
 }
 
 std::string ModuleResolver::resolve_and_bundle(std::string_view source) {
-    // Prepend polyfill imports to the source
-    std::string src = get_polyfill_imports() + std::string(source);
+    std::string src(source);
     
-    // Parse imports from the source (including polyfills)
+    // Parse imports from the source
     auto imports = parse_imports(src);
     
     // Also parse built-in module imports (they won't be caught by is_remote_url)

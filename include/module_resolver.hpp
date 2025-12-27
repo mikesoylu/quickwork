@@ -61,9 +61,6 @@ private:
     // Normalize URL (handle relative imports within esm.sh)
     [[nodiscard]] static std::string normalize_url(const std::string& base_url, 
                                                     const std::string& specifier);
-    
-    // Get polyfill imports to prepend to source
-    [[nodiscard]] static std::string get_polyfill_imports();
 
     // Module cache: URL -> source code
     std::unordered_map<std::string, std::string> module_cache_;

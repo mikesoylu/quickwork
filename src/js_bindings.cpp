@@ -3758,6 +3758,318 @@ static const char* streams_polyfill_source = R"JS(
     }
 
     // ============================================================================
+    // atob / btoa (Base64 encoding/decoding)
+    // ============================================================================
+    if (typeof globalThis.atob === 'undefined') {
+        const b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        const b64lookup = new Uint8Array(256);
+        for (let i = 0; i < b64chars.length; i++) {
+            b64lookup[b64chars.charCodeAt(i)] = i;
+        }
+
+        globalThis.btoa = function(data) {
+            const str = String(data);
+            let out = '';
+            for (let i = 0; i < str.length; i += 3) {
+                const c1 = str.charCodeAt(i);
+                const c2 = str.charCodeAt(i + 1);
+                const c3 = str.charCodeAt(i + 2);
+                out += b64chars[c1 >> 2];
+                out += b64chars[((c1 & 3) << 4) | (c2 >> 4)];
+                out += i + 1 < str.length ? b64chars[((c2 & 15) << 2) | (c3 >> 6)] : '=';
+                out += i + 2 < str.length ? b64chars[c3 & 63] : '=';
+            }
+            return out;
+        };
+
+        globalThis.atob = function(data) {
+            const str = String(data).replace(/=+$/, '');
+            if (str.length % 4 === 1) {
+                throw new DOMException('Invalid base64 string', 'InvalidCharacterError');
+            }
+            let out = '';
+            for (let i = 0; i < str.length; i += 4) {
+                const c1 = b64lookup[str.charCodeAt(i)];
+                const c2 = b64lookup[str.charCodeAt(i + 1)];
+                const c3 = b64lookup[str.charCodeAt(i + 2)];
+                const c4 = b64lookup[str.charCodeAt(i + 3)];
+                out += String.fromCharCode((c1 << 2) | (c2 >> 4));
+                if (i + 2 < str.length) out += String.fromCharCode(((c2 & 15) << 4) | (c3 >> 2));
+                if (i + 3 < str.length) out += String.fromCharCode(((c3 & 3) << 6) | c4);
+            }
+            return out;
+        };
+    }
+
+    // ============================================================================
+    // URLSearchParams implementation
+    // ============================================================================
+    if (typeof globalThis.URLSearchParams === 'undefined') {
+        class URLSearchParams {
+            #params = [];
+
+            constructor(init) {
+                if (typeof init === 'string') {
+                    const str = init.startsWith('?') ? init.slice(1) : init;
+                    if (str) {
+                        for (const pair of str.split('&')) {
+                            const [key, ...rest] = pair.split('=');
+                            const value = rest.join('=');
+                            this.#params.push([
+                                decodeURIComponent(key.replace(/\+/g, ' ')),
+                                decodeURIComponent((value || '').replace(/\+/g, ' '))
+                            ]);
+                        }
+                    }
+                } else if (Array.isArray(init)) {
+                    for (const [key, value] of init) {
+                        this.#params.push([String(key), String(value)]);
+                    }
+                } else if (init && typeof init === 'object') {
+                    if (init instanceof URLSearchParams) {
+                        for (const [key, value] of init) {
+                            this.#params.push([key, value]);
+                        }
+                    } else {
+                        for (const [key, value] of Object.entries(init)) {
+                            this.#params.push([String(key), String(value)]);
+                        }
+                    }
+                }
+            }
+
+            append(name, value) {
+                this.#params.push([String(name), String(value)]);
+            }
+
+            delete(name) {
+                this.#params = this.#params.filter(([k]) => k !== String(name));
+            }
+
+            get(name) {
+                const found = this.#params.find(([k]) => k === String(name));
+                return found ? found[1] : null;
+            }
+
+            getAll(name) {
+                return this.#params.filter(([k]) => k === String(name)).map(([, v]) => v);
+            }
+
+            has(name) {
+                return this.#params.some(([k]) => k === String(name));
+            }
+
+            set(name, value) {
+                const n = String(name);
+                const v = String(value);
+                let found = false;
+                this.#params = this.#params.filter(([k]) => {
+                    if (k === n && !found) {
+                        found = true;
+                        return true;
+                    }
+                    return k !== n;
+                });
+                if (found) {
+                    const idx = this.#params.findIndex(([k]) => k === n);
+                    if (idx !== -1) this.#params[idx][1] = v;
+                } else {
+                    this.#params.push([n, v]);
+                }
+            }
+
+            sort() {
+                this.#params.sort((a, b) => a[0].localeCompare(b[0]));
+            }
+
+            toString() {
+                return this.#params
+                    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+                    .join('&');
+            }
+
+            forEach(callback, thisArg) {
+                for (const [key, value] of this.#params) {
+                    callback.call(thisArg, value, key, this);
+                }
+            }
+
+            *entries() { yield* this.#params; }
+            *keys() { for (const [k] of this.#params) yield k; }
+            *values() { for (const [, v] of this.#params) yield v; }
+            [Symbol.iterator]() { return this.entries(); }
+
+            get size() { return this.#params.length; }
+        }
+        globalThis.URLSearchParams = URLSearchParams;
+    }
+
+    // ============================================================================
+    // URL implementation
+    // ============================================================================
+    if (typeof globalThis.URL === 'undefined') {
+        class URL {
+            #protocol = '';
+            #username = '';
+            #password = '';
+            #hostname = '';
+            #port = '';
+            #pathname = '/';
+            #search = '';
+            #hash = '';
+
+            constructor(url, base) {
+                let urlStr = String(url);
+                
+                // Handle relative URLs with base
+                if (base !== undefined) {
+                    const baseUrl = new URL(String(base));
+                    if (!urlStr.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:/)) {
+                        // Relative URL
+                        if (urlStr.startsWith('//')) {
+                            urlStr = baseUrl.protocol + urlStr;
+                        } else if (urlStr.startsWith('/')) {
+                            urlStr = baseUrl.origin + urlStr;
+                        } else if (urlStr.startsWith('?')) {
+                            urlStr = baseUrl.origin + baseUrl.pathname + urlStr;
+                        } else if (urlStr.startsWith('#')) {
+                            urlStr = baseUrl.origin + baseUrl.pathname + baseUrl.search + urlStr;
+                        } else {
+                            // Relative path
+                            const basePath = baseUrl.pathname.split('/').slice(0, -1).join('/');
+                            urlStr = baseUrl.origin + basePath + '/' + urlStr;
+                        }
+                    }
+                }
+
+                // Parse the URL
+                const match = urlStr.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(?:([^:@]*)(?::([^@]*))?@)?([^:/?#]*)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+                
+                if (!match) {
+                    throw new TypeError('Invalid URL: ' + url);
+                }
+
+                this.#protocol = match[1].toLowerCase() + ':';
+                this.#username = match[2] ? decodeURIComponent(match[2]) : '';
+                this.#password = match[3] ? decodeURIComponent(match[3]) : '';
+                this.#hostname = match[4].toLowerCase();
+                this.#port = match[5] || '';
+                this.#pathname = match[6] || '/';
+                this.#search = match[7] || '';
+                this.#hash = match[8] || '';
+
+                // Normalize pathname
+                this.#pathname = this.#pathname.split('/').reduce((acc, seg) => {
+                    if (seg === '..') acc.pop();
+                    else if (seg !== '.' && seg !== '') acc.push(seg);
+                    return acc;
+                }, ['']).join('/') || '/';
+            }
+
+            get protocol() { return this.#protocol; }
+            set protocol(v) { this.#protocol = String(v).toLowerCase().replace(/:*$/, ':'); }
+
+            get username() { return this.#username; }
+            set username(v) { this.#username = String(v); }
+
+            get password() { return this.#password; }
+            set password(v) { this.#password = String(v); }
+
+            get hostname() { return this.#hostname; }
+            set hostname(v) { this.#hostname = String(v).toLowerCase(); }
+
+            get port() { return this.#port; }
+            set port(v) { this.#port = String(v); }
+
+            get host() {
+                return this.#port ? this.#hostname + ':' + this.#port : this.#hostname;
+            }
+            set host(v) {
+                const match = String(v).match(/^([^:]+)(?::(\d+))?$/);
+                if (match) {
+                    this.#hostname = match[1].toLowerCase();
+                    this.#port = match[2] || '';
+                }
+            }
+
+            get pathname() { return this.#pathname; }
+            set pathname(v) { this.#pathname = '/' + String(v).replace(/^\/+/, ''); }
+
+            get search() { return this.#search; }
+            set search(v) {
+                const s = String(v);
+                this.#search = s ? (s.startsWith('?') ? s : '?' + s) : '';
+            }
+
+            get searchParams() {
+                const params = new URLSearchParams(this.#search);
+                const url = this;
+                // Create a proxy to sync changes back to URL
+                return new Proxy(params, {
+                    get(target, prop) {
+                        const value = target[prop];
+                        if (typeof value === 'function') {
+                            return function(...args) {
+                                const result = value.apply(target, args);
+                                if (['append', 'delete', 'set', 'sort'].includes(prop)) {
+                                    url.#search = target.toString() ? '?' + target.toString() : '';
+                                }
+                                return result;
+                            };
+                        }
+                        return value;
+                    }
+                });
+            }
+
+            get hash() { return this.#hash; }
+            set hash(v) {
+                const h = String(v);
+                this.#hash = h ? (h.startsWith('#') ? h : '#' + h) : '';
+            }
+
+            get origin() {
+                return this.#protocol + '//' + this.host;
+            }
+
+            get href() {
+                let url = this.#protocol + '//';
+                if (this.#username) {
+                    url += encodeURIComponent(this.#username);
+                    if (this.#password) url += ':' + encodeURIComponent(this.#password);
+                    url += '@';
+                }
+                url += this.host + this.#pathname + this.#search + this.#hash;
+                return url;
+            }
+            set href(v) {
+                const parsed = new URL(String(v));
+                this.#protocol = parsed.protocol;
+                this.#username = parsed.username;
+                this.#password = parsed.password;
+                this.#hostname = parsed.hostname;
+                this.#port = parsed.port;
+                this.#pathname = parsed.pathname;
+                this.#search = parsed.search;
+                this.#hash = parsed.hash;
+            }
+
+            toString() { return this.href; }
+            toJSON() { return this.href; }
+
+            static canParse(url, base) {
+                try {
+                    new URL(url, base);
+                    return true;
+                } catch {
+                    return false;
+                }
+            }
+        }
+        globalThis.URL = URL;
+    }
+
+    // ============================================================================
     // WebSocket stub (prevents errors from libraries that import isomorphic-ws)
     // The @libsql/client HTTP transport doesn't actually use WebSocket, but the
     // bundled code includes WebSocket references that fail if undefined
