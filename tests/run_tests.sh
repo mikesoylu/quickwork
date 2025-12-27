@@ -2238,6 +2238,64 @@ test_fetch_user_agent() {
     assert_contains "$response" '"userAgent":"QuickWork-Test/1.0"'
 }
 
+# Test: Stream in a large file and transform to uppercase while streaming out
+test_stream_large_file_uppercase() {
+    if ! check_network; then
+        log_debug "Skipping fetch test - no network"
+        ((TESTS_SKIPPED++))
+        return 0
+    fi
+    
+    local handler='export default async function(req) {
+        const stream = new StreamResponse({
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+        
+        // Fetch the large Shakespeare text file
+        const response = await fetch("https://gist.githubusercontent.com/blakesanie/dde3a2b7e698f52f389532b4b52bc254/raw/76fe1b5e9efcf0d2afdfd78b0bfaa737ad0a67d3/shakespeare.txt");
+        
+        if (!response.ok) {
+            stream.write("ERROR: Failed to fetch file");
+            stream.close();
+            return stream;
+        }
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        
+        let totalBytes = 0;
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            // Decode the chunk, transform to uppercase, and write to output stream
+            const text = decoder.decode(value, { stream: true });
+            const upperText = text.toUpperCase();
+            stream.write(upperText);
+            totalBytes += value.length;
+        }
+        
+        stream.close();
+        return stream;
+    }'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    # Execute and capture response with a longer timeout
+    local response
+    response=$(curl -s --max-time 60 -H "x-handler-id: $id" "${BASE_URL}/")
+    
+    # Verify the response is uppercase and contains expected Shakespeare content
+    # The original file starts with "From fairest creatures we desire increase"
+    # which should become "FROM FAIREST CREATURES WE DESIRE INCREASE"
+    assert_contains "$response" "FROM FAIREST CREATURES WE DESIRE INCREASE" && \
+    # Also verify it's substantial (the file is ~5.5MB)
+    [[ ${#response} -gt 1000000 ]]
+}
+
 # =============================================================================
 # POLYFILL TESTS
 # =============================================================================
@@ -3835,7 +3893,7 @@ main() {
     
     # Start server
     log "Starting server on port $PORT..."
-    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 &
+    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 --max-memory 1 &
     SERVER_PID=$!
     
     if ! wait_for_server; then
@@ -4004,6 +4062,7 @@ main() {
     run_test "Fetch streaming body (ReadableStream)" test_fetch_streaming_body
     run_test "Fetch sequential requests" test_fetch_sequential
     run_test "Fetch with User-Agent header" test_fetch_user_agent
+    run_test "Stream large file with uppercase transform" test_stream_large_file_uppercase
     
     # Print summary
     log_section "Test Results"
