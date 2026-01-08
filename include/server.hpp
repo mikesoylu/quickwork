@@ -37,6 +37,16 @@ public:
     // Check if running in dev mode
     [[nodiscard]] bool is_dev_mode() const noexcept { return config_.dev_mode; }
 
+    // Check deploy token (returns true if valid or no token required)
+    [[nodiscard]] bool check_deploy_token(std::string_view token) const noexcept {
+        return config_.deploy_token.empty() || config_.deploy_token == token;
+    }
+
+    // Check if deploy token is required
+    [[nodiscard]] bool requires_deploy_token() const noexcept {
+        return !config_.deploy_token.empty();
+    }
+
     // Active request tracking for idle timeout
     void request_started();
     void request_finished();

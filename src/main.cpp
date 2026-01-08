@@ -225,6 +225,8 @@ int main(int argc, char* argv[]) {
             "Max entries in shared KV store (LRU eviction)")
         ("idle-time,i", po::value<uint32_t>(&config.idle_timeout_seconds)->default_value(0),
             "Idle timeout in seconds (0 = disabled). Process exits when no active requests for this duration")
+        ("token", po::value<std::string>(&config.deploy_token)->default_value(""),
+            "Token required for deploy requests (via x-deploy-token header). Empty = no auth")
     ;
 
     po::variables_map vm;

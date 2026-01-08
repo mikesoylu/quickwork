@@ -115,6 +115,16 @@ private:
     }
 
     void handle_loader() {
+        // Check deploy token if required
+        if (server_.requires_deploy_token()) {
+            auto token_it = request_.find("x-deploy-token");
+            std::string_view token = token_it != request_.end() ? token_it->value() : "";
+            if (!server_.check_deploy_token(token)) {
+                send_error(401, "Invalid or missing deploy token");
+                return;
+            }
+        }
+
         // Track active request for idle timeout
         if (!request_active_) {
             request_active_ = true;
