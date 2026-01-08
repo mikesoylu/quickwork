@@ -1,0 +1,51 @@
+# Build stage - use Debian slim for building
+FROM debian:bookworm-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    cmake \
+    git \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    linux-libc-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy source files
+COPY CMakeLists.txt ./
+COPY include/ ./include/
+COPY src/ ./src/
+
+# Build with dynamic linking (simpler and more reliable)
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    && cmake --build build -j$(nproc)
+
+# Runtime stage - minimal Debian slim image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libcurl4 \
+    libssl3 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the binary
+COPY --from=builder /build/build/quickwork /usr/local/bin/quickwork
+
+# Create handlers directory
+WORKDIR /data
+
+# Expose default port
+EXPOSE 8080
+
+# Set entrypoint
+ENTRYPOINT ["quickwork"]
+CMD ["-p", "8080", "-c", "/data/handlers"]

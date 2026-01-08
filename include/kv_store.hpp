@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
 
 #include <list>
 #include <mutex>
