@@ -10,9 +10,11 @@ extern "C" {
 #include <openssl/rand.h>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -1195,12 +1197,6 @@ struct FetchResponse {
     std::unordered_map<std::string, std::string> headers;
 };
 
-size_t curl_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* response = static_cast<std::string*>(userdata);
-    response->append(ptr, size * nmemb);
-    return size * nmemb;
-}
-
 size_t curl_header_callback(char* buffer, size_t size, size_t nitems, void* userdata) {
     auto* headers = static_cast<std::unordered_map<std::string, std::string>*>(userdata);
     std::string header(buffer, size * nitems);
@@ -1223,74 +1219,6 @@ size_t curl_header_callback(char* buffer, size_t size, size_t nitems, void* user
     }
     
     return size * nitems;
-}
-
-FetchResponse perform_fetch(const std::string& url, const std::string& method,
-                           const std::unordered_map<std::string, std::string>& headers,
-                           const std::string& body) {
-    FetchResponse response;
-    
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        response.status_code = 0;
-        return response;
-    }
-    
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_callback);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response.headers);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    
-    // Set method
-    if (method == "POST") {
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-    } else if (method == "PUT") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-    } else if (method == "DELETE") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    } else if (method == "PATCH") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-    } else if (method == "HEAD") {
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    }
-    // GET is the default
-    
-    // Set headers
-    struct curl_slist* curl_headers = nullptr;
-    for (const auto& [key, value] : headers) {
-        std::string header_line = key + ": " + value;
-        curl_headers = curl_slist_append(curl_headers, header_line.c_str());
-    }
-    if (curl_headers) {
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
-    }
-    
-    // Perform request
-    CURLcode res = curl_easy_perform(curl);
-    
-    if (res == CURLE_OK) {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
-    } else {
-        response.status_code = 0;
-        response.body = curl_easy_strerror(res);
-    }
-    
-    if (curl_headers) {
-        curl_slist_free_all(curl_headers);
-    }
-    curl_easy_cleanup(curl);
-    
-    return response;
 }
 
 }  // anonymous namespace
