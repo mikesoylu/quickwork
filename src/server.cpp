@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <csignal>
 #include <sstream>
 
 namespace beast = boost::beast;
@@ -37,6 +38,13 @@ public:
         , handler_store_(store)
         , thread_pool_(pool)
     {
+    }
+
+    ~Session() {
+        // Ensure request is marked as finished if it was started
+        if (request_active_) {
+            server_.request_finished();
+        }
     }
 
     void run() {
@@ -107,6 +115,12 @@ private:
     }
 
     void handle_loader() {
+        // Track active request for idle timeout
+        if (!request_active_) {
+            request_active_ = true;
+            server_.request_started();
+        }
+
         try {
             std::string source = request_.body();
             if (source.empty()) {
@@ -134,6 +148,12 @@ private:
         if (!bytecode_opt) {
             send_error(404, "Handler not found", true);
             return;
+        }
+
+        // Track active request for idle timeout
+        if (!request_active_) {
+            request_active_ = true;
+            server_.request_started();
         }
 
         // Build request object for JS
@@ -290,6 +310,12 @@ private:
         beast::error_code ec;
         net::write(stream_.socket(), net::buffer("0\r\n\r\n"), ec);
         
+        // Mark request as finished for streaming responses
+        if (request_active_) {
+            request_active_ = false;
+            server_.request_finished();
+        }
+        
         // Close connection
         do_close();
     }
@@ -356,6 +382,12 @@ private:
     }
 
     void on_write(beast::error_code ec, bool close) {
+        // Mark request as finished when response is sent
+        if (request_active_) {
+            request_active_ = false;
+            server_.request_finished();
+        }
+
         if (ec) {
             std::cerr << "Write error: " << ec.message() << "\n";
             return;
@@ -379,6 +411,7 @@ private:
     Server& server_;
     HandlerStore& handler_store_;
     ThreadPool& thread_pool_;
+    bool request_active_{false};
 };
 
 class Listener : public std::enable_shared_from_this<Listener> {
@@ -634,6 +667,14 @@ void Server::run() {
         file_watcher_thread_ = std::thread([this] { watch_handler_file(); });
     }
 
+    // Start idle timeout watcher if configured
+    if (config_.idle_timeout_seconds > 0) {
+        idle_watcher_running_ = true;
+        // Initialize last request time to now (treat server start as last activity)
+        last_request_end_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+        idle_timeout_thread_ = std::thread([this] { idle_timeout_watcher(); });
+    }
+
     net::io_context ioc{static_cast<int>(config_.get_thread_count())};
 
     auto endpoint = tcp::endpoint{net::ip::make_address(config_.host), config_.port};
@@ -671,8 +712,57 @@ void Server::stop() {
                 file_watcher_thread_.join();
             }
         }
+
+        // Stop idle timeout watcher
+        if (idle_watcher_running_) {
+            idle_watcher_running_ = false;
+            // Check if we're being called from the idle timeout thread itself
+            // (happens when idle timeout triggers shutdown)
+            if (idle_timeout_thread_.joinable()) {
+                if (idle_timeout_thread_.get_id() == std::this_thread::get_id()) {
+                    // We're in the idle timeout thread, detach instead of join
+                    idle_timeout_thread_.detach();
+                } else {
+                    idle_timeout_thread_.join();
+                }
+            }
+        }
         
         thread_pool_->shutdown();
+    }
+}
+
+void Server::request_started() {
+    active_requests_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Server::request_finished() {
+    if (active_requests_.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        // Last request finished, update the timestamp
+        last_request_end_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    }
+}
+
+void Server::idle_timeout_watcher() {
+    const auto timeout = std::chrono::seconds(config_.idle_timeout_seconds);
+    
+    while (idle_watcher_running_) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        if (!idle_watcher_running_) break;
+        
+        // Check if there are no active requests
+        if (active_requests_.load(std::memory_order_relaxed) == 0) {
+            auto last_end = last_request_end_time_.load(std::memory_order_relaxed);
+            auto now = std::chrono::steady_clock::now();
+            
+            if (now - last_end >= timeout) {
+                std::cout << "\nIdle timeout reached (" << config_.idle_timeout_seconds << "s), shutting down...\n";
+                // Signal the process to exit
+                std::raise(SIGTERM);
+                break;
+            }
+        }
     }
 }
 

@@ -18,6 +18,7 @@ struct Config {
     size_t handler_cache_size = 1024;  // Max handlers in memory cache
     size_t max_cache_storage_mb = 0;  // Max disk storage for bytecode cache (0 = unlimited)
     size_t kv_max_entries = 10000;  // Max entries in the shared KV store
+    uint32_t idle_timeout_seconds = 0;  // Idle timeout in seconds (0 = disabled)
 
     // Dev mode settings
     bool dev_mode = false;

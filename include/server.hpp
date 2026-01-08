@@ -6,6 +6,7 @@
 #include "thread_pool.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -36,7 +37,13 @@ public:
     // Check if running in dev mode
     [[nodiscard]] bool is_dev_mode() const noexcept { return config_.dev_mode; }
 
+    // Active request tracking for idle timeout
+    void request_started();
+    void request_finished();
+
 private:
+    // Idle timeout check thread function
+    void idle_timeout_watcher();
     // Dev mode: reload handler from file
     void reload_dev_handler();
     
@@ -55,6 +62,12 @@ private:
     mutable std::shared_mutex dev_handler_mutex_;
     std::thread file_watcher_thread_;
     std::atomic<bool> watcher_running_{false};
+
+    // Idle timeout state
+    std::atomic<size_t> active_requests_{0};
+    std::atomic<std::chrono::steady_clock::time_point> last_request_end_time_{std::chrono::steady_clock::now()};
+    std::thread idle_timeout_thread_;
+    std::atomic<bool> idle_watcher_running_{false};
 };
 
 }  // namespace quickwork

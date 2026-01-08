@@ -223,6 +223,8 @@ int main(int argc, char* argv[]) {
             "Max disk storage for bytecode cache in MB (0 = unlimited)")
         ("kv-size,k", po::value<size_t>(&config.kv_max_entries)->default_value(10 * 1024),
             "Max entries in shared KV store (LRU eviction)")
+        ("idle-time,i", po::value<uint32_t>(&config.idle_timeout_seconds)->default_value(0),
+            "Idle timeout in seconds (0 = disabled). Process exits when no active requests for this duration")
     ;
 
     po::variables_map vm;
@@ -298,7 +300,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Max memory: " << config.max_memory_mb << " MB\n";
     std::cout << "Max CPU time: " << config.max_cpu_time_ms << " ms\n";
     std::cout << "KV store: " << config.kv_max_entries << " max entries\n";
-    std::cout << "Threads: " << (config.thread_count == 0 ? std::thread::hardware_concurrency() : config.thread_count) << "\n\n";
+    std::cout << "Threads: " << (config.thread_count == 0 ? std::thread::hardware_concurrency() : config.thread_count) << "\n";
+    if (config.idle_timeout_seconds > 0) {
+        std::cout << "Idle timeout: " << config.idle_timeout_seconds << " seconds\n";
+    }
+    std::cout << "\n";
 
     try {
         g_server = std::make_unique<quickwork::Server>(config);
