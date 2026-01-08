@@ -925,6 +925,24 @@ test_handler_not_found_header() {
     assert_contains "$response" "x-qw-handler-not-found: true"
 }
 
+# Test: Handler invocation via subdomain (alternative to x-handler-id header)
+test_subdomain_handler_invocation() {
+    local handler='export default function(req) {
+        return new Response("Hello from subdomain!");
+    }'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    # Execute handler via subdomain instead of x-handler-id header
+    # Use Host header to simulate subdomain: <handler-id>.localhost
+    local response
+    response=$(curl -s -H "Host: ${id}.localhost" "${BASE_URL}/")
+    
+    assert_equals "Hello from subdomain!" "$response"
+}
+
 # Test: Handler cannot forge x-qw-handler-not-found header
 test_handler_cannot_forge_not_found_header() {
     local handler='export default function(req) {
@@ -3966,6 +3984,7 @@ main() {
     run_test "Unknown handler ID" test_unknown_handler_id
     run_test "Handler not found header" test_handler_not_found_header
     run_test "Handler cannot forge not-found header" test_handler_cannot_forge_not_found_header
+    run_test "Subdomain handler invocation" test_subdomain_handler_invocation
     
     log_section "Edge Case Tests"
     run_test "Deep recursion (fib 25)" test_deep_recursion

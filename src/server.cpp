@@ -30,6 +30,39 @@ namespace quickwork {
 
 namespace {
 
+// Extract handler ID from subdomain in Host header
+// Format: <handler-id>.<base-domain> -> handler-id
+// Returns empty string if no valid subdomain found
+std::string extract_handler_id_from_host(std::string_view host) {
+    // Remove port if present
+    auto port_pos = host.find(':');
+    if (port_pos != std::string_view::npos) {
+        host = host.substr(0, port_pos);
+    }
+    
+    if (host.empty()) {
+        return "";
+    }
+    
+    // Skip IP addresses (no subdomain support for IPs)
+    // Check for IPv4: all characters are digits or dots
+    bool is_ipv4 = std::all_of(host.begin(), host.end(), [](char c) {
+        return std::isdigit(static_cast<unsigned char>(c)) || c == '.';
+    });
+    if (is_ipv4) {
+        return "";
+    }
+    
+    // Find first dot - everything before it is the subdomain (handler ID)
+    auto dot_pos = host.find('.');
+    if (dot_pos == std::string_view::npos || dot_pos == 0) {
+        return "";  // No subdomain or empty subdomain
+    }
+    
+    // The subdomain is the handler ID
+    return std::string(host.substr(0, dot_pos));
+}
+
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(tcp::socket socket, Server& server, HandlerStore& store, ThreadPool& pool)
@@ -89,17 +122,29 @@ private:
 
         // Check for handler-id header
         auto handler_id_it = request_.find("x-handler-id");
+        
+        // Try to get handler ID from subdomain if header not present
+        std::string handler_id;
+        if (handler_id_it != request_.end()) {
+            handler_id = std::string(handler_id_it->value());
+        } else {
+            // Try extracting from Host header subdomain
+            auto host_it = request_.find(http::field::host);
+            if (host_it != request_.end()) {
+                handler_id = extract_handler_id_from_host(host_it->value());
+            }
+        }
 
-        if (request_.method() == http::verb::post && handler_id_it == request_.end()) {
+        if (request_.method() == http::verb::post && handler_id.empty()) {
             // Handler loader endpoint (disabled in dev mode)
             if (server_.is_dev_mode()) {
                 send_error(400, "Handler registration disabled in dev mode");
                 return;
             }
             handle_loader();
-        } else if (handler_id_it != request_.end()) {
-            // Execute handler by ID
-            handle_execute(std::string(handler_id_it->value()));
+        } else if (!handler_id.empty()) {
+            // Execute handler by ID (from header or subdomain)
+            handle_execute(handler_id);
         } else if (server_.is_dev_mode()) {
             // Dev mode: use the dev handler for all requests without x-handler-id
             std::string dev_id = server_.get_dev_handler_id();
@@ -110,7 +155,7 @@ private:
             handle_execute(dev_id);
         } else {
             // No handler specified
-            send_error(400, "Missing x-handler-id header");
+            send_error(400, "Missing x-handler-id header or subdomain");
         }
     }
 
