@@ -31,8 +31,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${PROJECT_DIR}/build"
 QUICKWORK_BIN="${BUILD_DIR}/quickwork"
 PORT="${TEST_PORT:-9999}"
+PORT_SINGLE="${TEST_PORT_SINGLE:-9998}"  # Single-threaded server port for concurrency tests
 HOST="127.0.0.1"
 BASE_URL="http://${HOST}:${PORT}"
+BASE_URL_SINGLE="http://${HOST}:${PORT_SINGLE}"  # Single-threaded server URL
 VERBOSE=0
 KEEP_SERVER=0
 SPECIFIC_TEST=""
@@ -85,21 +87,29 @@ log_section() { echo -e "\n${BOLD}${YELLOW}=== $* ===${NC}\n"; }
 
 # Cleanup function
 cleanup() {
-    if [[ $KEEP_SERVER -eq 0 ]] && [[ -n "${SERVER_PID:-}" ]]; then
-        log "Stopping server (PID: $SERVER_PID)..."
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
+    if [[ $KEEP_SERVER -eq 0 ]]; then
+        if [[ -n "${SERVER_PID:-}" ]]; then
+            log "Stopping server (PID: $SERVER_PID)..."
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+        fi
+        if [[ -n "${SERVER_SINGLE_PID:-}" ]]; then
+            log "Stopping single-threaded server (PID: $SERVER_SINGLE_PID)..."
+            kill "$SERVER_SINGLE_PID" 2>/dev/null || true
+            wait "$SERVER_SINGLE_PID" 2>/dev/null || true
+        fi
     fi
 }
 trap cleanup EXIT
 
 # Wait for server to be ready
 wait_for_server() {
+    local url="${1:-$BASE_URL}"
     local max_attempts=50
     local attempt=0
     
     while [[ $attempt -lt $max_attempts ]]; do
-        if curl -s "${BASE_URL}/health" > /dev/null 2>&1; then
+        if curl -s "${url}/health" > /dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -765,6 +775,62 @@ test_streaming_with_timeout() {
     assert_contains "$response" "start" && \
     assert_contains "$response" "delayed" && \
     assert_contains "$response" "end"
+}
+
+# Test: Streaming concurrency - multiple streaming requests should run concurrently
+# This test verifies that streaming handlers don't block each other, even with -j 1
+# Uses the single-threaded server (PORT_SINGLE) to prove async concurrency on one thread
+test_streaming_concurrency() {
+    # Handler that takes 1 second total (3 events with 333ms delays)
+    local handler='export default async function(req) {
+        const stream = new StreamResponse();
+        
+        function pause(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+        
+        for (let i = 1; i <= 3; i++) {
+            stream.write("data: Event " + i + "\n\n");
+            await pause(333);
+        }
+        
+        stream.close();
+        return stream;
+    }'
+    
+    # Register handler on the SINGLE-THREADED server
+    local id
+    id=$(curl -s -X POST "${BASE_URL_SINGLE}" \
+        -H "Content-Type: application/javascript" \
+        -d "$handler" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    [[ -z "$id" ]] && return 1
+    
+    # Send 5 concurrent requests to the SINGLE-THREADED server
+    # Each request takes ~1 second
+    # If concurrent (async on single thread): should complete in ~1-2 seconds
+    # If sequential (blocking): would take ~5 seconds
+    local start_ms end_ms elapsed_ms
+    start_ms=$(python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || date +%s%3N)
+    
+    local pids=()
+    for i in 1 2 3 4 5; do
+        curl -s -H "x-handler-id: $id" "${BASE_URL_SINGLE}/" > /dev/null &
+        pids+=($!)
+    done
+    
+    # Wait for all requests to complete
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+    done
+    
+    end_ms=$(python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || date +%s%3N)
+    elapsed_ms=$((end_ms - start_ms))
+    
+    log_debug "Streaming concurrency test (-j 1): 5 requests completed in ${elapsed_ms}ms"
+    
+    # Should complete in under 2500ms if running concurrently on the single thread
+    # (each request is ~1000ms, sequential would be ~5000ms)
+    [[ $elapsed_ms -lt 2500 ]]
 }
 
 # Test: Redirect response
@@ -3909,16 +3975,27 @@ main() {
         exit 1
     fi
     
-    # Start server
-    log "Starting server on port $PORT..."
-    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 --max-memory 4 &
+    # Start main server with multiple threads (-j 8)
+    log "Starting main server on port $PORT with -j 8..."
+    "$QUICKWORK_BIN" --port "$PORT" --kv-size 100 --max-memory 4 -j 8 &
     SERVER_PID=$!
     
-    if ! wait_for_server; then
+    if ! wait_for_server "$BASE_URL"; then
         exit 1
     fi
     
-    log "Server started (PID: $SERVER_PID)"
+    log "Main server started (PID: $SERVER_PID)"
+    
+    # Start single-threaded server (-j 1) for concurrency tests
+    log "Starting single-threaded server on port $PORT_SINGLE with -j 1..."
+    "$QUICKWORK_BIN" --port "$PORT_SINGLE" --kv-size 100 --max-memory 4 -j 1 &
+    SERVER_SINGLE_PID=$!
+    
+    if ! wait_for_server "$BASE_URL_SINGLE"; then
+        exit 1
+    fi
+    
+    log "Single-threaded server started (PID: $SERVER_SINGLE_PID)"
     
     # Run tests by category
     log_section "Basic Response Tests"
@@ -3960,6 +4037,7 @@ main() {
     run_test "Streaming text response" test_streaming_text
     run_test "SSE streaming with events" test_streaming_sse
     run_test "Streaming with setTimeout" test_streaming_with_timeout
+    run_test "Streaming concurrency (-j 1, 5 parallel requests)" test_streaming_concurrency
     
     log_section "Crypto & Utilities"
     run_test "crypto.randomUUID()" test_crypto_randomUUID

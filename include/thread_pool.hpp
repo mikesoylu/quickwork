@@ -6,12 +6,32 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
 
 namespace quickwork {
+
+// Represents an async handler execution in progress
+struct AsyncTask {
+    std::unique_ptr<JsContext> context;
+    std::function<void(ExecutionResult)> callback;
+    StreamWriter stream_writer;  // Keep stream writer alive during async execution
+    
+    AsyncTask(std::unique_ptr<JsContext> ctx, std::function<void(ExecutionResult)> cb,
+              StreamWriter sw = nullptr)
+        : context(std::move(ctx)), callback(std::move(cb)), stream_writer(std::move(sw)) {}
+};
+
+// Task to start a new handler execution
+struct NewTask {
+    Bytecode bytecode;
+    HttpRequest request;
+    std::function<void(ExecutionResult)> callback;
+    StreamWriter stream_writer;  // Optional stream writer for SSE responses
+};
 
 class ThreadPool {
 public:
@@ -31,6 +51,12 @@ public:
     template <typename F, typename Callback>
     void enqueue_with_callback(F&& f, Callback&& callback);
 
+    // New async API: enqueue handler execution with callback
+    // Optional stream_writer enables streaming responses (SSE)
+    void enqueue_handler(Bytecode bytecode, HttpRequest request, 
+                         std::function<void(ExecutionResult)> callback,
+                         StreamWriter stream_writer = nullptr);
+
     void shutdown();
 
 private:
@@ -39,6 +65,7 @@ private:
     const Config& config_;
     std::vector<std::thread> workers_;
     std::queue<std::function<void(JsRuntime&)>> tasks_;
+    std::queue<NewTask> new_tasks_;  // Queue of new handler tasks
 
     std::mutex queue_mutex_;
     std::condition_variable condition_;

@@ -112,6 +112,10 @@ JsContext::JsContext(JSRuntime* rt, const Config& config) : config_(config) {
 
 JsContext::~JsContext() {
     if (ctx_) {
+        // Free pending promise if any
+        if (!JS_IsUndefined(pending_promise_)) {
+            JS_FreeValue(ctx_, pending_promise_);
+        }
         bindings::cleanup_timers(ctx_);
         bindings::cleanup_pending_fetches(ctx_);
         JS_FreeContext(ctx_);
@@ -124,20 +128,29 @@ JsContext::JsContext(JsContext&& other) noexcept
     , start_time_(other.start_time_)
     , has_error_(other.has_error_)
     , error_message_(std::move(other.error_message_))
+    , pending_promise_(other.pending_promise_)
+    , pending_result_(std::move(other.pending_result_))
 {
     other.ctx_ = nullptr;
+    other.pending_promise_ = JS_UNDEFINED;
 }
 
 JsContext& JsContext::operator=(JsContext&& other) noexcept {
     if (this != &other) {
         if (ctx_) {
+            if (!JS_IsUndefined(pending_promise_)) {
+                JS_FreeValue(ctx_, pending_promise_);
+            }
             JS_FreeContext(ctx_);
         }
         ctx_ = other.ctx_;
         start_time_ = other.start_time_;
         has_error_ = other.has_error_;
         error_message_ = std::move(other.error_message_);
+        pending_promise_ = other.pending_promise_;
+        pending_result_ = std::move(other.pending_result_);
         other.ctx_ = nullptr;
+        other.pending_promise_ = JS_UNDEFINED;
     }
     return *this;
 }
@@ -276,49 +289,58 @@ std::optional<HttpResponse> JsContext::extract_response(JSValue val) {
     return response;
 }
 
-std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
+// Non-blocking promise poll - returns true if promise is resolved/rejected
+bool JsContext::poll_promise() {
+    if (JS_IsUndefined(pending_promise_)) {
+        return true;  // No pending promise, we're done
+    }
+
     JSContext* ctx_ptr = nullptr;
-    int ret;
+    
+    // Execute pending JS jobs (microtasks) - just one iteration
+    int ret = JS_ExecutePendingJob(JS_GetRuntime(ctx_), &ctx_ptr);
+    if (ret < 0) {
+        handle_exception();
+        return true;  // Error, stop polling
+    }
+    
+    // Process any expired timers
+    bindings::process_timers(ctx_);
+    
+    // Process any pending fetch operations
+    bindings::process_pending_fetches(ctx_);
 
-    while (true) {
-        // Execute pending JS jobs (microtasks)
-        ret = JS_ExecutePendingJob(JS_GetRuntime(ctx_), &ctx_ptr);
-        if (ret < 0) {
-            handle_exception();
-            return std::nullopt;
-        }
-        
-        // Process any expired timers
-        bool timer_fired = bindings::process_timers(ctx_);
-        
-        // Process any pending fetch operations
-        bool fetch_processed = bindings::process_pending_fetches(ctx_);
-        
-        // If no jobs, no timers fired, and no fetches processed, check if we should continue waiting
-        if (ret == 0 && !timer_fired && !fetch_processed) {
-            // Check if there are pending timers or fetches we need to wait for
-            if (!bindings::has_pending_timers(ctx_) && !bindings::has_pending_fetches(ctx_)) {
-                break;
-            }
-            // Small sleep to avoid busy-waiting
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
+    // Check timeout
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_);
+    if (elapsed.count() > static_cast<int64_t>(config_.max_cpu_time_ms)) {
+        error_message_ = "Execution timeout";
+        has_error_ = true;
+        return true;  // Timeout, stop polling
+    }
 
-        // Check timeout
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_);
-        if (elapsed.count() > static_cast<int64_t>(config_.max_cpu_time_ms)) {
-            error_message_ = "Execution timeout";
-            has_error_ = true;
-            return std::nullopt;
-        }
+    // Check promise state
+    JSPromiseStateEnum state = JS_PromiseState(ctx_, pending_promise_);
+    return state != JS_PROMISE_PENDING;
+}
+
+std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
+    // Store the promise for polling
+    pending_promise_ = JS_DupValue(ctx_, promise);
+
+    // Block until resolved (legacy blocking behavior)
+    while (!poll_promise()) {
+        // Small sleep to avoid busy-waiting
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     // Get promise result
-    JSPromiseStateEnum state = JS_PromiseState(ctx_, promise);
+    JSPromiseStateEnum state = JS_PromiseState(ctx_, pending_promise_);
 
     if (state == JS_PROMISE_FULFILLED) {
-        JSValue result = JS_PromiseResult(ctx_, promise);
+        JSValue result = JS_PromiseResult(ctx_, pending_promise_);
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
         if (JS_IsException(result)) {
             handle_exception();
             JS_FreeValue(ctx_, result);
@@ -326,7 +348,9 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
         }
         return extract_response(result);
     } else if (state == JS_PROMISE_REJECTED) {
-        JSValue reason = JS_PromiseResult(ctx_, promise);
+        JSValue reason = JS_PromiseResult(ctx_, pending_promise_);
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
         const char* err_str = JS_ToCString(ctx_, reason);
         if (err_str) {
             error_message_ = err_str;
@@ -338,18 +362,18 @@ std::optional<HttpResponse> JsContext::await_promise(JSValue promise) {
         has_error_ = true;
         return std::nullopt;
     } else {
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
         error_message_ = "Promise did not resolve";
         has_error_ = true;
         return std::nullopt;
     }
 }
 
-ExecutionResult JsContext::execute_handler(
+bool JsContext::start_handler(
     const Bytecode& bytecode,
     const HttpRequest& request)
 {
-    ExecutionResult exec_result;
-    
     // Create request object and set it globally
     JSValue global = JS_GetGlobalObject(ctx_);
     JSValue request_obj = bindings::create_request(ctx_, request);
@@ -361,8 +385,8 @@ ExecutionResult JsContext::execute_handler(
     
     if (JS_IsException(obj)) {
         handle_exception();
-        exec_result.error = error_message_;
-        return exec_result;
+        pending_result_.error = error_message_;
+        return true;  // Done (with error)
     }
 
     // Evaluate the loaded bytecode (executes the compiled script, setting up __handler__)
@@ -370,8 +394,8 @@ ExecutionResult JsContext::execute_handler(
     
     if (JS_IsException(setup_result)) {
         handle_exception();
-        exec_result.error = error_message_;
-        return exec_result;
+        pending_result_.error = error_message_;
+        return true;  // Done (with error)
     }
     JS_FreeValue(ctx_, setup_result);
 
@@ -390,25 +414,141 @@ ExecutionResult JsContext::execute_handler(
 
     if (JS_IsException(result)) {
         handle_exception();
-        exec_result.error = error_message_;
-        return exec_result;
+        pending_result_.error = error_message_;
+        return true;  // Done (with error)
     }
 
-    exec_result.response = extract_response(result);
-    
+    // Check if it's a Promise
+    if (JS_IsObject(result)) {
+        JSValue then_val = JS_GetPropertyStr(ctx_, result, "then");
+        bool is_promise = JS_IsFunction(ctx_, then_val);
+        JS_FreeValue(ctx_, then_val);
+
+        if (is_promise) {
+            // Check if the promise is already resolved (common for simple async functions)
+            JSPromiseStateEnum state = JS_PromiseState(ctx_, result);
+            if (state == JS_PROMISE_FULFILLED) {
+                // Promise already resolved - extract result immediately
+                JSValue promise_result = JS_PromiseResult(ctx_, result);
+                JS_FreeValue(ctx_, result);
+                pending_result_.response = extract_response(promise_result);
+                finalize_result();
+                return true;  // Done immediately
+            } else if (state == JS_PROMISE_REJECTED) {
+                // Promise already rejected
+                JSValue reason = JS_PromiseResult(ctx_, result);
+                JS_FreeValue(ctx_, result);
+                const char* err_str = JS_ToCString(ctx_, reason);
+                if (err_str) {
+                    error_message_ = err_str;
+                    JS_FreeCString(ctx_, err_str);
+                } else {
+                    error_message_ = "Promise rejected";
+                }
+                JS_FreeValue(ctx_, reason);
+                has_error_ = true;
+                pending_result_.error = error_message_;
+                finalize_result();
+                return true;  // Done (with error)
+            }
+            
+            // Promise still pending - needs async polling
+            pending_promise_ = result;  // Takes ownership
+            return false;  // Not done yet, needs polling
+        }
+    }
+
+    // Synchronous result - extract immediately
+    pending_result_.response = extract_response(result);
+    finalize_result();
+    return true;  // Done
+}
+
+bool JsContext::poll() {
+    if (JS_IsUndefined(pending_promise_)) {
+        return true;  // No pending promise, already done
+    }
+
+    // Non-blocking poll
+    if (!poll_promise()) {
+        return false;  // Still pending
+    }
+
+    // Promise resolved/rejected - extract result
+    JSPromiseStateEnum state = JS_PromiseState(ctx_, pending_promise_);
+
+    if (state == JS_PROMISE_FULFILLED) {
+        JSValue result = JS_PromiseResult(ctx_, pending_promise_);
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
+        
+        if (JS_IsException(result)) {
+            handle_exception();
+            pending_result_.error = error_message_;
+            JS_FreeValue(ctx_, result);
+        } else {
+            // Note: extract_response handles recursive promises
+            pending_result_.response = extract_response(result);
+        }
+    } else if (state == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(ctx_, pending_promise_);
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
+        
+        const char* err_str = JS_ToCString(ctx_, reason);
+        if (err_str) {
+            error_message_ = err_str;
+            JS_FreeCString(ctx_, err_str);
+        } else {
+            error_message_ = "Promise rejected";
+        }
+        JS_FreeValue(ctx_, reason);
+        has_error_ = true;
+        pending_result_.error = error_message_;
+    } else {
+        // Timeout or other issue
+        JS_FreeValue(ctx_, pending_promise_);
+        pending_promise_ = JS_UNDEFINED;
+        pending_result_.error = error_message_.empty() ? "Promise did not resolve" : error_message_;
+    }
+
+    finalize_result();
+    return true;
+}
+
+void JsContext::finalize_result() {
     // Collect stats - use actual CPU time, not wall-clock time
     double end_cpu_time_ms = get_thread_cpu_time_ms();
-    exec_result.stats.cpu_time_ms = end_cpu_time_ms - g_start_cpu_time_ms;
+    pending_result_.stats.cpu_time_ms = end_cpu_time_ms - g_start_cpu_time_ms;
     
     JSMemoryUsage mem_usage;
     JS_ComputeMemoryUsage(JS_GetRuntime(ctx_), &mem_usage);
-    exec_result.stats.memory_used = static_cast<size_t>(mem_usage.memory_used_size);
+    pending_result_.stats.memory_used = static_cast<size_t>(mem_usage.memory_used_size);
     
-    if (!exec_result.response) {
-        exec_result.error = error_message_;
+    if (!pending_result_.response && pending_result_.error.empty()) {
+        pending_result_.error = error_message_;
+    }
+}
+
+ExecutionResult JsContext::get_result() {
+    return std::move(pending_result_);
+}
+
+ExecutionResult JsContext::execute_handler(
+    const Bytecode& bytecode,
+    const HttpRequest& request)
+{
+    // Use the new async API but block until complete
+    if (start_handler(bytecode, request)) {
+        return get_result();
     }
     
-    return exec_result;
+    // Poll until complete
+    while (!poll()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    
+    return get_result();
 }
 
 }  // namespace quickwork

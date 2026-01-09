@@ -59,6 +59,20 @@ public:
     JsContext(JsContext&&) noexcept;
     JsContext& operator=(JsContext&&) noexcept;
 
+    // Start executing a handler, returns true if result is ready immediately
+    // If false, use poll() to check for completion
+    [[nodiscard]] bool start_handler(
+        const Bytecode& bytecode,
+        const HttpRequest& request
+    );
+
+    // Poll for completion of async handler. Returns true if done.
+    [[nodiscard]] bool poll();
+
+    // Get the final result after poll() returns true or start_handler() returns true
+    [[nodiscard]] ExecutionResult get_result();
+
+    // Legacy blocking API - executes handler and blocks until complete
     [[nodiscard]] ExecutionResult execute_handler(
         const Bytecode& bytecode,
         const HttpRequest& request
@@ -68,19 +82,26 @@ public:
     [[nodiscard]] JSRuntime* runtime() const noexcept { return JS_GetRuntime(ctx_); }
     [[nodiscard]] bool has_error() const noexcept { return has_error_; }
     [[nodiscard]] const std::string& get_error() const noexcept { return error_message_; }
+    [[nodiscard]] bool is_pending() const noexcept { return !JS_IsUndefined(pending_promise_); }
 
 private:
     void setup_bindings();
     void setup_interrupt_handler();
     [[nodiscard]] std::optional<HttpResponse> extract_response(JSValue val);
     [[nodiscard]] std::optional<HttpResponse> await_promise(JSValue promise);
+    [[nodiscard]] bool poll_promise();  // Non-blocking promise poll
     void handle_exception();
+    void finalize_result();
 
     JSContext* ctx_ = nullptr;
     const Config& config_;
     std::chrono::steady_clock::time_point start_time_;
     bool has_error_ = false;
     std::string error_message_;
+    
+    // For async execution
+    JSValue pending_promise_ = JS_UNDEFINED;
+    ExecutionResult pending_result_;
 };
 
 class JsRuntime {

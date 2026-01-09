@@ -224,26 +224,24 @@ private:
 
         Bytecode bytecode = std::move(*bytecode_opt);
 
-        // Execute on thread pool with streaming support
+        // Execute on thread pool - uses async handler API that allows concurrent requests per thread
         auto self = shared_from_this();
         
         // Shared state for streaming
         auto streaming_state = std::make_shared<StreamingState>();
         
-        thread_pool_.enqueue_with_callback(
-            [self, bytecode = std::move(bytecode), js_request = std::move(js_request), streaming_state]
-            (JsRuntime& runtime) -> ExecutionResult {
-                // Set up stream writer that queues chunks
-                bindings::set_stream_writer(nullptr, [self, streaming_state](std::string_view chunk) {
-                    std::lock_guard<std::mutex> lock(streaming_state->mutex);
-                    streaming_state->chunks.push(std::string(chunk));
-                    streaming_state->has_data = true;
-                    streaming_state->cv.notify_one();
-                });
-                
-                auto ctx = runtime.create_context();
-                auto result = ctx.execute_handler(bytecode, js_request);
-                
+        // Create stream writer that queues chunks for async delivery
+        StreamWriter stream_writer = [self, streaming_state](std::string_view chunk) {
+            std::lock_guard<std::mutex> lock(streaming_state->mutex);
+            streaming_state->chunks.push(std::string(chunk));
+            streaming_state->has_data = true;
+            streaming_state->cv.notify_one();
+        };
+        
+        thread_pool_.enqueue_handler(
+            std::move(bytecode),
+            std::move(js_request),
+            [self, streaming_state](ExecutionResult result) {
                 // Signal streaming complete
                 {
                     std::lock_guard<std::mutex> lock(streaming_state->mutex);
@@ -251,24 +249,25 @@ private:
                     streaming_state->cv.notify_one();
                 }
                 
-                // Clear stream writer
-                bindings::set_stream_writer(nullptr, nullptr);
-                
-                return result;
+                // Post the response back to the session's executor
+                net::post(self->stream_.get_executor(), [self, streaming_state, result = std::move(result)]() {
+                    // Check if this was a streaming response (with lock for thread safety)
+                    {
+                        std::lock_guard<std::mutex> lock(streaming_state->mutex);
+                        if (streaming_state->has_data) {
+                            // Streaming was handled separately
+                            return;
+                        }
+                    }
+                    
+                    if (result.response) {
+                        self->send_js_response(*result.response, result.stats);
+                    } else {
+                        self->send_error(500, result.error.empty() ? "Handler execution failed" : result.error);
+                    }
+                });
             },
-            [self, streaming_state](ExecutionResult result) {
-                // Check if this was a streaming response
-                if (streaming_state->has_data) {
-                    // Streaming was handled separately
-                    return;
-                }
-                
-                if (result.response) {
-                    self->send_js_response(*result.response, result.stats);
-                } else {
-                    self->send_error(500, result.error.empty() ? "Handler execution failed" : result.error);
-                }
-            }
+            std::move(stream_writer)
         );
         
         // Start streaming consumer on this thread
@@ -285,28 +284,66 @@ private:
         bool headers_sent = false;
         bool complete = false;
         bool has_data = false;
+        bool consumer_active = false;  // Prevent multiple consumers
     };
     
+    // Non-blocking stream consumer - processes available chunks and reschedules itself
     void consume_stream(std::shared_ptr<StreamingState> state) {
-        // Wait for first chunk or completion
-        std::unique_lock<std::mutex> lock(state->mutex);
+        std::vector<std::string> chunks_to_send;
+        bool should_finish = false;
+        bool should_reschedule = false;
+        bool need_headers = false;
         
-        // Wait until we have streaming data or the handler completes
-        while (!state->has_data && !state->complete) {
-            state->cv.wait_for(lock, std::chrono::milliseconds(100));
+        // Quick lock to check state and grab any available chunks
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            
+            // If already complete with no data, let regular callback handle it
+            if (state->complete && !state->has_data) {
+                return;
+            }
+            
+            // If no data yet and not complete, reschedule
+            if (!state->has_data && !state->complete) {
+                should_reschedule = true;
+            } else if (state->has_data) {
+                // Check if we need to send headers
+                if (!state->headers_sent) {
+                    state->headers_sent = true;
+                    need_headers = true;
+                }
+                
+                // Grab all available chunks
+                while (!state->chunks.empty()) {
+                    chunks_to_send.push_back(std::move(state->chunks.front()));
+                    state->chunks.pop();
+                }
+                
+                // Check if we're done
+                if (state->complete && state->chunks.empty()) {
+                    should_finish = true;
+                } else {
+                    should_reschedule = true;
+                }
+            }
         }
         
-        // If no streaming data and complete, let the regular callback handle it
-        if (!state->has_data && state->complete) {
+        // Reschedule if we need to wait for more data
+        if (should_reschedule && chunks_to_send.empty() && !should_finish) {
+            auto self = shared_from_this();
+            // Use a timer for a short delay to avoid busy spinning
+            auto timer = std::make_shared<net::steady_timer>(stream_.get_executor());
+            timer->expires_after(std::chrono::milliseconds(1));
+            timer->async_wait([self, state, timer](beast::error_code ec) {
+                if (!ec) {
+                    self->consume_stream(state);
+                }
+            });
             return;
         }
         
-        // Send headers if not sent yet (only if we have streaming data)
-        if (!state->headers_sent && state->has_data) {
-            state->headers_sent = true;
-            lock.unlock();
-            
-            // Send chunked response headers
+        // Send headers if needed
+        if (need_headers) {
             std::string headers = "HTTP/1.1 200 OK\r\n"
                                   "Server: quickwork\r\n"
                                   "Content-Type: text/event-stream\r\n"
@@ -321,58 +358,48 @@ private:
                 std::cerr << "Error sending headers: " << ec.message() << "\n";
                 return;
             }
-            
-            lock.lock();
         }
         
-        // Process chunks
-        while (true) {
-            // Wait for chunk or completion
-            state->cv.wait_for(lock, std::chrono::milliseconds(50), [&state] {
-                return !state->chunks.empty() || state->complete;
-            });
+        // Send all chunks we grabbed
+        for (const auto& chunk : chunks_to_send) {
+            std::ostringstream oss;
+            oss << std::hex << chunk.size() << "\r\n" << chunk << "\r\n";
+            std::string chunk_data = oss.str();
             
-            // Send all available chunks
-            while (!state->chunks.empty()) {
-                std::string chunk = std::move(state->chunks.front());
-                state->chunks.pop();
-                lock.unlock();
-                
-                // Send chunk in HTTP chunked format
-                std::ostringstream oss;
-                oss << std::hex << chunk.size() << "\r\n" << chunk << "\r\n";
-                std::string chunk_data = oss.str();
-                
-                beast::error_code ec;
-                net::write(stream_.socket(), net::buffer(chunk_data), ec);
-                if (ec) {
-                    std::cerr << "Error sending chunk: " << ec.message() << "\n";
-                    return;
+            beast::error_code ec;
+            net::write(stream_.socket(), net::buffer(chunk_data), ec);
+            if (ec) {
+                std::cerr << "Error sending chunk: " << ec.message() << "\n";
+                return;
+            }
+        }
+        
+        // If we need to finish, send final chunk and close
+        if (should_finish) {
+            beast::error_code ec;
+            const char final_chunk[] = "0\r\n\r\n";
+            net::write(stream_.socket(), net::buffer(final_chunk, sizeof(final_chunk) - 1), ec);
+            
+            if (request_active_) {
+                request_active_ = false;
+                server_.request_finished();
+            }
+            
+            do_close();
+            return;
+        }
+        
+        // Reschedule to check for more chunks
+        if (should_reschedule) {
+            auto self = shared_from_this();
+            auto timer = std::make_shared<net::steady_timer>(stream_.get_executor());
+            timer->expires_after(std::chrono::milliseconds(1));
+            timer->async_wait([self, state, timer](beast::error_code ec) {
+                if (!ec) {
+                    self->consume_stream(state);
                 }
-                
-                lock.lock();
-            }
-            
-            // Check if complete
-            if (state->complete && state->chunks.empty()) {
-                break;
-            }
+            });
         }
-        
-        lock.unlock();
-        
-        // Send final chunk
-        beast::error_code ec;
-        net::write(stream_.socket(), net::buffer("0\r\n\r\n"), ec);
-        
-        // Mark request as finished for streaming responses
-        if (request_active_) {
-            request_active_ = false;
-            server_.request_finished();
-        }
-        
-        // Close connection
-        do_close();
     }
 
     void send_js_response(const HttpResponse& js_response, const ExecutionStats& stats) {
