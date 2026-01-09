@@ -214,7 +214,9 @@ int main(int argc, char* argv[]) {
         ("max-memory,m", po::value<size_t>(&config.max_memory_mb)->default_value(64),
             "Max memory per runtime in MB")
         ("max-cpu-time,t", po::value<uint32_t>(&config.max_cpu_time_ms)->default_value(5000),
-            "Max CPU time per request in ms")
+            "Max CPU time per request in ms (actual JS execution time)")
+        ("max-wall-time,w", po::value<uint32_t>(&config.max_wall_time_ms)->default_value(30000),
+            "Max wall-clock time per request in ms (includes async wait time)")
         ("threads,j", po::value<size_t>(&config.thread_count)->default_value(0),
             "Number of worker threads (0 = auto)")
         ("cache-size,s", po::value<size_t>(&config.handler_cache_size)->default_value(1024),
@@ -301,6 +303,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Max storage: " << (config.max_cache_storage_mb == 0 ? "unlimited" : std::to_string(config.max_cache_storage_mb) + " MB") << "\n";
     std::cout << "Max memory: " << config.max_memory_mb << " MB\n";
     std::cout << "Max CPU time: " << config.max_cpu_time_ms << " ms\n";
+    std::cout << "Max wall time: " << config.max_wall_time_ms << " ms\n";
     std::cout << "KV store: " << config.kv_max_entries << " max entries\n";
     std::cout << "Threads: " << (config.thread_count == 0 ? std::thread::hardware_concurrency() : config.thread_count) << "\n";
     if (config.idle_timeout_seconds > 0) {

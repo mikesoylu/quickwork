@@ -673,6 +673,47 @@ test_error_handling() {
     assert_contains "$response" "500" || assert_contains "$response" "error"
 }
 
+# Test: CPU timeout kills infinite loop
+test_cpu_timeout_infinite_loop() {
+    local handler='export default function(req) {
+        while(true) { }
+        return new Response("Never reached");
+    }'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(timeout 10 curl -s -H "x-handler-id: $id" "${BASE_URL}/")
+    
+    # Should return an error about being interrupted
+    assert_contains "$response" "error" || assert_contains "$response" "interrupted"
+}
+
+# Test: CPU timeout does NOT kill setTimeout (async wait doesn't count as CPU time)
+test_cpu_timeout_allows_settimeout() {
+    # This test uses a handler that waits 2 seconds via setTimeout
+    # With default 5s CPU limit, this should complete successfully
+    # because setTimeout doesn't consume CPU time
+    local handler='export default async function(req) {
+        const start = Date.now();
+        await new Promise(r => setTimeout(r, 2000));
+        const elapsed = Date.now() - start;
+        return Response.json({ elapsed: elapsed, success: elapsed >= 2000 });
+    }'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(timeout 10 curl -s -H "x-handler-id: $id" "${BASE_URL}/")
+    
+    # Should complete successfully with elapsed time >= 2000ms
+    assert_contains "$response" '"success":true'
+}
+
 # Test: TextDecoder for Uint8Array to string
 test_text_decoder() {
     local handler='export default function(req) {
@@ -4054,6 +4095,8 @@ main() {
     
     log_section "Error Handling & Edge Cases"
     run_test "Error handling in handler" test_error_handling
+    run_test "CPU timeout kills infinite loop" test_cpu_timeout_infinite_loop
+    run_test "CPU timeout allows setTimeout" test_cpu_timeout_allows_settimeout
     run_test "Handler isolation" test_handler_isolation
     run_test "Concurrent execution" test_concurrent_execution
     run_test "Handler caching/reuse" test_handler_caching

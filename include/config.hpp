@@ -13,7 +13,8 @@ struct Config {
     uint16_t port = 8080;
     std::filesystem::path cache_dir = "./handlers";
     size_t max_memory_mb = 64;
-    uint32_t max_cpu_time_ms = 5000;
+    uint32_t max_cpu_time_ms = 5000;  // Max CPU time for JS execution
+    uint32_t max_wall_time_ms = 30000;  // Max wall-clock time (for long async operations)
     size_t thread_count = 0;  // 0 = hardware concurrency
     size_t handler_cache_size = 1024;  // Max handlers in memory cache
     size_t max_cache_storage_mb = 0;  // Max disk storage for bytecode cache (0 = unlimited)

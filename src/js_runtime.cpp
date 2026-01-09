@@ -62,9 +62,10 @@ double get_thread_cpu_time_ms() {
 }
 
 int interrupt_handler(JSRuntime* /*rt*/, void* /*opaque*/) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_start_time);
-    return elapsed.count() > g_max_cpu_time_ms ? 1 : 0;
+    // Use actual CPU time, not wall-clock time
+    // This allows handlers to wait on setTimeout/fetch without being killed
+    double cpu_elapsed_ms = get_thread_cpu_time_ms() - g_start_cpu_time_ms;
+    return cpu_elapsed_ms > g_max_cpu_time_ms ? 1 : 0;
 }
 
 }  // namespace
@@ -310,11 +311,20 @@ bool JsContext::poll_promise() {
     // Process any pending fetch operations
     bindings::process_pending_fetches(ctx_);
 
-    // Check timeout
+    // Check CPU time timeout (not wall-clock time)
+    // This allows handlers to wait on setTimeout/fetch without being killed
+    double cpu_elapsed_ms = get_thread_cpu_time_ms() - g_start_cpu_time_ms;
+    if (cpu_elapsed_ms > static_cast<double>(config_.max_cpu_time_ms)) {
+        error_message_ = "CPU time limit exceeded";
+        has_error_ = true;
+        return true;  // Timeout, stop polling
+    }
+    
+    // Also check wall-clock time as a safety limit for long async operations
     auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_);
-    if (elapsed.count() > static_cast<int64_t>(config_.max_cpu_time_ms)) {
-        error_message_ = "Execution timeout";
+    auto wall_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_);
+    if (wall_elapsed.count() > static_cast<int64_t>(config_.max_wall_time_ms)) {
+        error_message_ = "Wall-clock time limit exceeded";
         has_error_ = true;
         return true;  // Timeout, stop polling
     }
