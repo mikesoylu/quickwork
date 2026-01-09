@@ -39,7 +39,8 @@ Options:
   -p [ --port ] arg (=8080)            Port to listen on
   -c [ --cache-dir ] arg (=./handlers) Handler cache directory
   -m [ --max-memory ] arg (=64)        Max memory per runtime in MB
-  -t [ --max-cpu-time ] arg (=5000)    Max CPU time per request in ms
+  -t [ --max-cpu-time ] arg (=5000)    Max CPU time per request in ms (JS execution only)
+  -w [ --max-wall-time ] arg (=30000)  Max wall-clock time per request in ms (total duration)
   -j [ --threads ] arg (=0)            Number of worker threads (0 = auto)
   -s [ --cache-size ] arg (=1024)      Max handlers in memory cache (LRU)
   -S [ --max-storage ] arg (=0)        Max disk storage for bytecode cache in MB (0 = unlimited)
@@ -191,6 +192,33 @@ Use `setTimeout` for delayed execution:
 export default async function(req) {
   await new Promise(resolve => setTimeout(resolve, 100));
   return new Response("Waited 100ms");
+}
+```
+
+### Resource Limits
+
+quickwork enforces two types of time limits:
+
+- **CPU time** (`--max-cpu-time`, default 5s): Limits actual JavaScript execution time. Time spent waiting on `setTimeout`, `fetch`, or other async operations does **not** count toward this limit. This prevents infinite loops while allowing legitimate async workflows.
+
+- **Wall-clock time** (`--max-wall-time`, default 30s): Limits total request duration including all async waits. This is a safety limit to prevent handlers from running indefinitely.
+
+Example: A handler that fetches data from a slow API (10 seconds) and does minimal processing will:
+- Use ~0ms of CPU time (just the JS execution)
+- Use ~10s of wall-clock time (waiting for the API)
+
+```javascript
+// This handler will succeed with default limits (5s CPU, 30s wall)
+// even though it takes 10+ seconds to complete
+export default async function(req) {
+  // Waiting doesn't count as CPU time
+  const response = await fetch("https://slow-api.example.com/data");
+  return Response.json(await response.json());
+}
+
+// This handler will be killed after ~5s of CPU time
+export default function(req) {
+  while (true) { } // Infinite loop uses 100% CPU
 }
 ```
 
@@ -420,8 +448,8 @@ The Docker container accepts the same command-line options:
 # Custom port and cache directory
 docker run -d -p 3000:3000 quickwork -p 3000 -c /data/cache
 
-# Limit resources
-docker run -d -p 8080:8080 quickwork -m 32 -t 1000 -j 4
+# Limit resources (32MB memory, 1s CPU limit, 10s wall limit, 4 threads)
+docker run -d -p 8080:8080 quickwork -m 32 -t 1000 -w 10000 -j 4
 
 # With volume for persistent handler cache
 docker run -d -p 8080:8080 \
