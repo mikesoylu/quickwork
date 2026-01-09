@@ -41,10 +41,12 @@ bool ModuleResolver::is_remote_url(const std::string& specifier) {
            specifier.find("esm.sh/") == 0;
 }
 
-// Check if this is a Node.js polyfill path that we should skip
-// (we provide our own Buffer and process polyfills)
+// Check if this is a Node.js polyfill path from esm.sh
+// We now fetch these instead of skipping them, as many npm packages
+// (like memfs) need full Node.js API compatibility
 bool ModuleResolver::is_node_polyfill(const std::string& specifier) {
-    // Skip esm.sh node polyfill imports - we have our own
+    // Node polyfills from esm.sh - we fetch these now instead of skipping
+    // to provide full Node.js API compatibility for packages like memfs
     if (specifier.find("/node/") != std::string::npos) {
         return true;
     }
@@ -419,14 +421,9 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     
     std::ostringstream bundled;
     
-    // First, recursively resolve all dependencies
+    // First, recursively resolve all dependencies (including Node.js polyfills from esm.sh)
     for (const auto& imp : imports) {
         std::string dep_url = normalize_url(normalized_url, imp.specifier);
-        
-        // Skip Node.js polyfills - we provide our own Buffer and process
-        if (is_node_polyfill(dep_url)) {
-            continue;
-        }
         
         std::string dep_source = resolve_module(dep_url, visited);
         if (!dep_source.empty()) {
@@ -439,51 +436,6 @@ std::string ModuleResolver::resolve_module(const std::string& url,
     
     for (const auto& imp : imports) {
         std::string dep_url = imp.specifier;  // Already normalized by parse_imports_with_base
-        
-        // For Node.js polyfills, just remove the import statement
-        // Our runtime provides Buffer and process globally
-        if (is_node_polyfill(dep_url)) {
-            size_t pos = transformed.find(imp.full_match);
-            if (pos != std::string::npos) {
-                std::ostringstream comment;
-                comment << "/* Node polyfill " << dep_url << " provided by runtime */\n";
-                
-                // If it's importing specific things, map them to our globals
-                if (!imp.default_name.empty()) {
-                    if (dep_url.find("buffer") != std::string::npos) {
-                        comment << "const " << imp.default_name << " = globalThis.Buffer;\n";
-                    } else if (dep_url.find("process") != std::string::npos) {
-                        comment << "const " << imp.default_name << " = globalThis.process;\n";
-                    }
-                }
-                
-                for (const auto& named : imp.names) {
-                    std::string name = named;
-                    size_t as_pos = name.find(" as ");
-                    std::string local_name = name;
-                    std::string import_name = name;
-                    if (as_pos != std::string::npos) {
-                        import_name = name.substr(0, as_pos);
-                        local_name = name.substr(as_pos + 4);
-                    }
-                    // Trim
-                    import_name.erase(0, import_name.find_first_not_of(" \t"));
-                    import_name.erase(import_name.find_last_not_of(" \t") + 1);
-                    local_name.erase(0, local_name.find_first_not_of(" \t"));
-                    local_name.erase(local_name.find_last_not_of(" \t") + 1);
-                    
-                    if (dep_url.find("buffer") != std::string::npos && import_name == "Buffer") {
-                        comment << "const " << local_name << " = globalThis.Buffer;\n";
-                    } else if (dep_url.find("process") != std::string::npos) {
-                        comment << "const " << local_name << " = globalThis.process;\n";
-                    }
-                }
-                
-                transformed.replace(pos, imp.full_match.length(), comment.str());
-            }
-            continue;
-        }
-        
         std::string var_name = url_to_var_name(dep_url);
         
         if (imp.is_dynamic) {

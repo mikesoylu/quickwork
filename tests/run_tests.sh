@@ -1220,6 +1220,46 @@ export default function(req) {
     assert_contains "$response" '"isFunction":true'
 }
 
+# Test: ESM import memfs (in-memory filesystem with Node.js polyfills)
+test_esm_import_memfs() {
+    # Check network connectivity first
+    if ! curl -s --connect-timeout 2 "https://esm.sh" > /dev/null 2>&1; then
+        log_debug "Skipping ESM test - no network connectivity"
+        ((TESTS_SKIPPED++))
+        return 0
+    fi
+    
+    local handler='import memfs from "https://esm.sh/memfs";
+
+export default function(req) {
+    // Test that memfs loaded and has expected exports
+    const hasFs = "fs" in memfs;
+    const hasVolume = "Volume" in memfs;
+    
+    // Test basic file operations using the default fs
+    const exists1 = memfs.fs.existsSync("/nonexistent.txt");
+    
+    return Response.json({ 
+        imported: true,
+        hasFs: hasFs,
+        hasVolume: hasVolume,
+        existsCheck: exists1 === false
+    });
+}'
+    
+    local id
+    id=$(register_handler "$handler")
+    [[ -z "$id" ]] && return 1
+    
+    local response
+    response=$(execute_handler "$id")
+    
+    assert_contains "$response" '"imported":true' && \
+    assert_contains "$response" '"hasFs":true' && \
+    assert_contains "$response" '"hasVolume":true' && \
+    assert_contains "$response" '"existsCheck":true'
+}
+
 # Test: Promise.all with fetch (mock endpoint)
 test_promise_all_with_delayed_operations() {
     local handler='export default async function(req) {
@@ -4092,6 +4132,7 @@ main() {
     run_test "ESM import Neon serverless" test_esm_import_neon
     run_test "ESM import Turso/libsql HTTP" test_esm_import_turso
     run_test "ESM import Supabase JS" test_esm_import_supabase
+    run_test "ESM import memfs (Node.js polyfills)" test_esm_import_memfs
     
     log_section "Error Handling & Edge Cases"
     run_test "Error handling in handler" test_error_handling
