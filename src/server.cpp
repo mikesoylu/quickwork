@@ -60,7 +60,16 @@ std::string extract_handler_id_from_host(std::string_view host) {
     }
     
     // The subdomain is the handler ID
-    return std::string(host.substr(0, dot_pos));
+    auto sub = std::string(host.substr(0, dot_pos));
+
+    // length should be exactly 32 hex characters
+    if (sub.length() != 32 || !std::all_of(sub.begin(), sub.end(), [](char c) {
+        return std::isxdigit(static_cast<unsigned char>(c));
+    })) {
+        return "";
+    }
+
+    return sub;
 }
 
 class Session : public std::enable_shared_from_this<Session> {
